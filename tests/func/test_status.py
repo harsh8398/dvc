@@ -49,7 +49,7 @@ def test_status_non_dvc_repo_import(tmp_dir, dvc, git_dir):
 
 
 def test_status_before_and_after_dvc_init(tmp_dir, dvc, git_dir):
-    git_dir.scm_gen("file", "first version", commit="first verison")
+    git_dir.scm_gen("file", "first version", commit="first version")
     old_rev = git_dir.scm.get_rev()
 
     dvc.imp(os.fspath(git_dir), "file", "file")
@@ -58,7 +58,7 @@ def test_status_before_and_after_dvc_init(tmp_dir, dvc, git_dir):
 
     with git_dir.chdir():
         git_dir.init(dvc=True)
-        git_dir.scm.repo.index.remove(["file"])
+        git_dir.scm.gitpython.repo.index.remove(["file"])
         os.remove("file")
         git_dir.dvc_gen("file", "second version", commit="with dvc")
         new_rev = git_dir.scm.get_rev()
@@ -67,9 +67,7 @@ def test_status_before_and_after_dvc_init(tmp_dir, dvc, git_dir):
 
     (status,) = dvc.status(["file.dvc"])["file.dvc"]
     assert status == {
-        "changed deps": {
-            "file ({})".format(os.fspath(git_dir)): "update available"
-        }
+        "changed deps": {f"file ({os.fspath(git_dir)})": "update available"}
     }
 
 

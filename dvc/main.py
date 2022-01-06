@@ -1,17 +1,11 @@
 """Main entry point for dvc CLI."""
-
-import errno
 import logging
-from contextlib import contextmanager
 
-from dvc import analytics
+from dvc._debug import debugtools
 from dvc.cli import parse_args
 from dvc.config import ConfigError
 from dvc.exceptions import DvcException, DvcParserError, NotDvcRepoError
-from dvc.external_repo import clean_repos
 from dvc.logger import FOOTER, disable_other_loggers
-from dvc.tree.pool import close_pools
-from dvc.utils import error_link
 
 # Workaround for CPython bug. See [1] and [2] for more info.
 # [1] https://github.com/aws/aws-cli/blob/1.16.277/awscli/clidriver.py#L55
@@ -20,26 +14,6 @@ from dvc.utils import error_link
 "".encode("idna")
 
 logger = logging.getLogger("dvc")
-
-
-@contextmanager
-def profile(enable, dump):
-    if not enable:
-        yield
-        return
-
-    import cProfile
-
-    prof = cProfile.Profile()
-    prof.enable()
-
-    yield
-
-    prof.disable()
-    if not dump:
-        prof.print_stats(sort="cumtime")
-        return
-    prof.dump_stats(dump)
 
 
 def main(argv=None):  # noqa: C901
@@ -71,9 +45,14 @@ def main(argv=None):  # noqa: C901
 
         logger.trace(args)
 
-        with profile(enable=args.cprofile, dump=args.cprofile_dump):
+        if not args.quiet:
+            from dvc.ui import ui
+
+            ui.enable()
+
+        with debugtools(args):
             cmd = args.func(args)
-            ret = cmd.run()
+            ret = cmd.do_run()
     except ConfigError:
         logger.exception("configuration error")
         ret = 251
@@ -90,7 +69,11 @@ def main(argv=None):  # noqa: C901
         logger.exception("")
     except Exception as exc:  # noqa, pylint: disable=broad-except
         # pylint: disable=no-member
+        import errno
+
         if isinstance(exc, OSError) and exc.errno == errno.EMFILE:
+            from dvc.utils import error_link
+
             logger.exception(
                 "too many open files, please visit "
                 "{} to see how to handle this "
@@ -109,6 +92,8 @@ def main(argv=None):  # noqa: C901
         ret = 255
 
     try:
+        from dvc import analytics
+
         if analytics.is_enabled():
             analytics.collect_and_send_report(args, ret)
 
@@ -116,10 +101,14 @@ def main(argv=None):  # noqa: C901
     finally:
         logger.setLevel(outerLogLevel)
 
+        from dvc.fs.pool import close_pools
+
         # Closing pools by-hand to prevent weird messages when closing SSH
         # connections. See https://github.com/iterative/dvc/issues/3248 for
         # more info.
         close_pools()
+
+        from dvc.external_repo import clean_repos
 
         # Remove cached repos in the end of the call, these are anonymous
         # so won't be reused by any other subsequent run anyway.

@@ -3,25 +3,29 @@ import logging
 
 from dvc.command import completion
 from dvc.command.base import CmdBase, append_doc_link
-from dvc.command.checkout import log_changes
-from dvc.exceptions import CheckoutError, DvcException
-from dvc.utils.humanize import get_summary
 
 logger = logging.getLogger(__name__)
 
 
 class CmdDataBase(CmdBase):
     def log_summary(self, stats):
+        from dvc.ui import ui
+        from dvc.utils.humanize import get_summary
+
         default_msg = "Everything is up to date."
-        logger.info(get_summary(stats.items()) or default_msg)
+        ui.write(get_summary(stats.items()) or default_msg)
 
 
 class CmdDataPull(CmdDataBase):
     def log_summary(self, stats):
+        from dvc.command.checkout import log_changes
+
         log_changes(stats)
         super().log_summary(stats)
 
     def run(self):
+        from dvc.exceptions import CheckoutError, DvcException
+
         try:
             stats = self.repo.pull(
                 targets=self.args.targets,
@@ -34,6 +38,7 @@ class CmdDataPull(CmdDataBase):
                 force=self.args.force,
                 recursive=self.args.recursive,
                 run_cache=self.args.run_cache,
+                glob=self.args.glob,
             )
             self.log_summary(stats)
         except (CheckoutError, DvcException) as exc:
@@ -46,6 +51,8 @@ class CmdDataPull(CmdDataBase):
 
 class CmdDataPush(CmdDataBase):
     def run(self):
+        from dvc.exceptions import DvcException
+
         try:
             processed_files_count = self.repo.push(
                 targets=self.args.targets,
@@ -57,6 +64,7 @@ class CmdDataPush(CmdDataBase):
                 with_deps=self.args.with_deps,
                 recursive=self.args.recursive,
                 run_cache=self.args.run_cache,
+                glob=self.args.glob,
             )
             self.log_summary({"pushed": processed_files_count})
         except DvcException:
@@ -67,6 +75,8 @@ class CmdDataPush(CmdDataBase):
 
 class CmdDataFetch(CmdDataBase):
     def run(self):
+        from dvc.exceptions import DvcException
+
         try:
             processed_files_count = self.repo.fetch(
                 targets=self.args.targets,
@@ -130,7 +140,7 @@ def add_parser(subparsers, _parent_parser):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     pull_parser.add_argument(
-        "-r", "--remote", help="Remote storage to pull from", metavar="<name>",
+        "-r", "--remote", help="Remote storage to pull from", metavar="<name>"
     )
     pull_parser.add_argument(
         "-a",
@@ -147,6 +157,7 @@ def add_parser(subparsers, _parent_parser):
         help="Fetch cache for all tags.",
     )
     pull_parser.add_argument(
+        "-A",
         "--all-commits",
         action="store_true",
         default=False,
@@ -179,6 +190,12 @@ def add_parser(subparsers, _parent_parser):
         default=False,
         help="Fetch run history for all stages.",
     )
+    pull_parser.add_argument(
+        "--glob",
+        action="store_true",
+        default=False,
+        help="Pull cache for targets matching shell-style wildcards.",
+    )
     pull_parser.set_defaults(func=CmdDataPull)
 
     # Push
@@ -192,7 +209,7 @@ def add_parser(subparsers, _parent_parser):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     push_parser.add_argument(
-        "-r", "--remote", help="Remote storage to push to", metavar="<name>",
+        "-r", "--remote", help="Remote storage to push to", metavar="<name>"
     )
     push_parser.add_argument(
         "-a",
@@ -209,6 +226,7 @@ def add_parser(subparsers, _parent_parser):
         help="Push cache for all tags.",
     )
     push_parser.add_argument(
+        "-A",
         "--all-commits",
         action="store_true",
         default=False,
@@ -234,12 +252,17 @@ def add_parser(subparsers, _parent_parser):
         default=False,
         help="Push run history for all stages.",
     )
+    push_parser.add_argument(
+        "--glob",
+        action="store_true",
+        default=False,
+        help="Allows targets containing shell-style wildcards.",
+    )
     push_parser.set_defaults(func=CmdDataPush)
 
     # Fetch
     FETCH_HELP = (
-        "Get tracked files or directories from remote storage"
-        " into the cache."
+        "Download files or directories from remote storage to the cache."
     )
 
     fetch_parser = subparsers.add_parser(
@@ -250,10 +273,7 @@ def add_parser(subparsers, _parent_parser):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     fetch_parser.add_argument(
-        "-r",
-        "--remote",
-        help="Remote storage to fetch from",
-        metavar="<name>",
+        "-r", "--remote", help="Remote storage to fetch from", metavar="<name>"
     )
     fetch_parser.add_argument(
         "-a",
@@ -270,6 +290,7 @@ def add_parser(subparsers, _parent_parser):
         help="Fetch cache for all tags.",
     )
     fetch_parser.add_argument(
+        "-A",
         "--all-commits",
         action="store_true",
         default=False,
@@ -350,6 +371,7 @@ def add_parser(subparsers, _parent_parser):
         "for all tags.",
     )
     status_parser.add_argument(
+        "-A",
         "--all-commits",
         action="store_true",
         default=False,
@@ -371,6 +393,7 @@ def add_parser(subparsers, _parent_parser):
         help="Show status of all stages in the specified directory.",
     )
     status_parser.add_argument(
+        "--json",
         "--show-json",
         action="store_true",
         default=False,

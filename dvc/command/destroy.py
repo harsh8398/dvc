@@ -1,15 +1,16 @@
 import argparse
 import logging
 
-import dvc.prompt as prompt
 from dvc.command.base import CmdBase, append_doc_link
-from dvc.exceptions import DvcException
 
 logger = logging.getLogger(__name__)
 
 
 class CmdDestroy(CmdBase):
     def run(self):
+        from dvc.exceptions import DvcException
+        from dvc.ui import ui
+
         try:
             statement = (
                 "This will destroy all information about your pipelines,"
@@ -18,7 +19,7 @@ class CmdDestroy(CmdBase):
                 "Are you sure you want to continue?"
             )
 
-            if not self.args.force and not prompt.confirm(statement):
+            if not self.args.force and not ui.confirm(statement):
                 raise DvcException(
                     "cannot destroy without a confirmation from the user."
                     " Use `-f` to force."
@@ -32,7 +33,7 @@ class CmdDestroy(CmdBase):
 
 
 def add_parser(subparsers, parent_parser):
-    DESTROY_HELP = "Remove DVC-files, local DVC config and data cache."
+    DESTROY_HELP = "Remove DVC files, local DVC config and data cache."
 
     destroy_parser = subparsers.add_parser(
         "destroy",

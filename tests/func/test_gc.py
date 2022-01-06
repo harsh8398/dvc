@@ -7,9 +7,10 @@ import pytest
 from git import Repo
 
 from dvc.exceptions import CollectCacheError
+from dvc.fs.local import LocalFileSystem
 from dvc.main import main
+from dvc.objects.db.local import LocalObjectDB
 from dvc.repo import Repo as DvcRepo
-from dvc.tree.local import LocalTree
 from dvc.utils.fs import remove
 from tests.basic_env import TestDir, TestDvcGit
 
@@ -21,13 +22,13 @@ class TestGC(TestDvcGit):
         self.dvc.add(self.FOO)
         self.dvc.add(self.DATA_DIR)
         self.good_cache = [
-            self.dvc.cache.local.tree.hash_to_path_info(md5)
-            for md5 in self.dvc.cache.local.tree.all()
+            self.dvc.odb.local.hash_to_path(md5)
+            for md5 in self.dvc.odb.local.all()
         ]
 
         self.bad_cache = []
         for i in ["123", "234", "345"]:
-            path = os.path.join(self.dvc.cache.local.cache_dir, i[0:2], i[2:])
+            path = os.path.join(self.dvc.odb.local.cache_dir, i[0:2], i[2:])
             self.create(path, i)
             self.bad_cache.append(path)
 
@@ -41,7 +42,7 @@ class TestGC(TestDvcGit):
         self._test_gc()
 
     def _test_gc(self):
-        self.assertTrue(os.path.isdir(self.dvc.cache.local.cache_dir))
+        self.assertTrue(os.path.isdir(self.dvc.odb.local.cache_dir))
         for c in self.bad_cache:
             self.assertFalse(os.path.exists(c))
 
@@ -59,7 +60,7 @@ class TestGCBranchesTags(TestDvcGit):
     def test(self):
         fname = "file"
 
-        with open(fname, "w+") as fobj:
+        with open(fname, "w+", encoding="utf-8") as fobj:
             fobj.write("v1.0")
 
         stages = self.dvc.add(fname)
@@ -70,7 +71,7 @@ class TestGCBranchesTags(TestDvcGit):
 
         self.dvc.scm.checkout("test", create_new=True)
         self.dvc.remove(stages[0].relpath)
-        with open(fname, "w+") as fobj:
+        with open(fname, "w+", encoding="utf-8") as fobj:
             fobj.write("test")
         stages = self.dvc.add(fname)
         self.assertEqual(len(stages), 1)
@@ -79,7 +80,7 @@ class TestGCBranchesTags(TestDvcGit):
 
         self.dvc.scm.checkout("master")
         self.dvc.remove(stages[0].relpath)
-        with open(fname, "w+") as fobj:
+        with open(fname, "w+", encoding="utf-8") as fobj:
             fobj.write("trash")
         stages = self.dvc.add(fname)
         self.assertEqual(len(stages), 1)
@@ -87,7 +88,7 @@ class TestGCBranchesTags(TestDvcGit):
         self.dvc.scm.commit("trash")
 
         self.dvc.remove(stages[0].relpath)
-        with open(fname, "w+") as fobj:
+        with open(fname, "w+", encoding="utf-8") as fobj:
             fobj.write("master")
         stages = self.dvc.add(fname)
         self.assertEqual(len(stages), 1)
@@ -137,7 +138,7 @@ class TestGCMultipleDvcRepos(TestDvcGit):
 
         # ADD FILE ONLY IN MAIN PROJECT
         fname = "only_in_first"
-        with open(fname, "w+") as fobj:
+        with open(fname, "w+", encoding="utf-8") as fobj:
             fobj.write("only in main repo")
 
         stages = self.dvc.add(fname)
@@ -145,7 +146,7 @@ class TestGCMultipleDvcRepos(TestDvcGit):
 
         # ADD FILE IN MAIN PROJECT THAT IS ALSO IN SECOND PROJECT
         fname = "in_both"
-        with open(fname, "w+") as fobj:
+        with open(fname, "w+", encoding="utf-8") as fobj:
             fobj.write("in both repos")
 
         stages = self.dvc.add(fname)
@@ -155,7 +156,7 @@ class TestGCMultipleDvcRepos(TestDvcGit):
         os.chdir(self.additional_path)
         # ADD FILE ONLY IN SECOND PROJECT
         fname = "only_in_second"
-        with open(fname, "w+") as fobj:
+        with open(fname, "w+", encoding="utf-8") as fobj:
             fobj.write("only in additional repo")
 
         stages = self.additional_dvc.add(fname)
@@ -163,7 +164,7 @@ class TestGCMultipleDvcRepos(TestDvcGit):
 
         # ADD FILE IN SECOND PROJECT THAT IS ALSO IN MAIN PROJECT
         fname = "in_both"
-        with open(fname, "w+") as fobj:
+        with open(fname, "w+", encoding="utf-8") as fobj:
             fobj.write("in both repos")
 
         stages = self.additional_dvc.add(fname)
@@ -186,11 +187,11 @@ def test_all_commits(tmp_dir, scm, dvc):
     tmp_dir.dvc_gen("testfile", "modified", commit="modified")
     tmp_dir.dvc_gen("testfile", "workspace")
 
-    n = _count_files(dvc.cache.local.cache_dir)
+    n = _count_files(dvc.odb.local.cache_dir)
     dvc.gc(all_commits=True)
 
     # Only one uncommitted file should go away
-    assert _count_files(dvc.cache.local.cache_dir) == n - 1
+    assert _count_files(dvc.odb.local.cache_dir) == n - 1
 
 
 def test_gc_no_dir_cache(tmp_dir, dvc):
@@ -202,9 +203,9 @@ def test_gc_no_dir_cache(tmp_dir, dvc):
     with pytest.raises(CollectCacheError):
         dvc.gc(workspace=True)
 
-    assert _count_files(dvc.cache.local.cache_dir) == 4
+    assert _count_files(dvc.odb.local.cache_dir) == 4
     dvc.gc(force=True, workspace=True)
-    assert _count_files(dvc.cache.local.cache_dir) == 2
+    assert _count_files(dvc.odb.local.cache_dir) == 2
 
 
 def _count_files(path):
@@ -217,7 +218,7 @@ def test_gc_no_unpacked_dir(tmp_dir, dvc):
 
     os.remove("dir.dvc")
     unpackeddir = (
-        dir_stages[0].outs[0].cache_path + LocalTree.UNPACKED_DIR_SUFFIX
+        dir_stages[0].outs[0].cache_path + LocalObjectDB.UNPACKED_DIR_SUFFIX
     )
 
     # older (pre 1.0) versions of dvc used to generate this dir
@@ -270,7 +271,7 @@ def test_gc_without_workspace(tmp_dir, dvc, caplog):
 
     assert (
         "Either of `-w|--workspace`, `-a|--all-branches`, `-T|--all-tags` "
-        "or `--all-commits` needs to be set."
+        "`--all-experiments` or `--all-commits` needs to be set."
     ) in caplog.text
 
 
@@ -280,20 +281,12 @@ def test_gc_cloud_without_any_specifier(tmp_dir, dvc, caplog):
 
     assert (
         "Either of `-w|--workspace`, `-a|--all-branches`, `-T|--all-tags` "
-        "or `--all-commits` needs to be set."
+        "`--all-experiments` or `--all-commits` needs to be set."
     ) in caplog.text
 
 
 def test_gc_with_possible_args_positive(tmp_dir, dvc):
-    for flag in [
-        "-w",
-        "-a",
-        "-T",
-        "--all-commits",
-        "-aT",
-        "-wa",
-        "-waT",
-    ]:
+    for flag in ["-w", "-a", "-T", "--all-commits", "-aT", "-wa", "-waT"]:
         assert main(["gc", "-vf", flag]) == 0
 
 
@@ -320,7 +313,9 @@ def test_gc_cloud_remove_order(tmp_dir, scm, dvc, tmp_path_factory, mocker):
     dvc.remove(dir2.relpath)
     dvc.gc(workspace=True)
 
-    mocked_remove = mocker.patch.object(LocalTree, "remove", autospec=True)
+    mocked_remove = mocker.patch.object(
+        LocalFileSystem, "remove", autospec=True
+    )
     dvc.gc(workspace=True, cloud=True)
     assert len(mocked_remove.mock_calls) == 8
     # dir (and unpacked dir) should be first 4 checksums removed from
@@ -338,32 +333,16 @@ def test_gc_not_collect_pipeline_tracked_files(tmp_dir, dvc, run_copy):
 
     run_copy("foo", "foo2", name="copy")
     shutil.rmtree(dvc.stage_cache.cache_dir)
-    assert _count_files(dvc.cache.local.cache_dir) == 1
+    assert _count_files(dvc.odb.local.cache_dir) == 1
     dvc.gc(workspace=True, force=True)
-    assert _count_files(dvc.cache.local.cache_dir) == 1
+    assert _count_files(dvc.odb.local.cache_dir) == 1
 
     # remove pipeline file and lockfile and check
     Dvcfile(dvc, PIPELINE_FILE).remove(force=True)
     dvc.gc(workspace=True, force=True)
-    assert _count_files(dvc.cache.local.cache_dir) == 0
+    assert _count_files(dvc.odb.local.cache_dir) == 0
 
 
-@pytest.mark.parametrize(
-    "workspace",
-    [
-        pytest.lazy_fixture("local_cloud"),
-        pytest.lazy_fixture("s3"),
-        pytest.lazy_fixture("gs"),
-        pytest.lazy_fixture("hdfs"),
-        pytest.param(
-            pytest.lazy_fixture("ssh"),
-            marks=pytest.mark.skipif(
-                os.name == "nt", reason="disabled on windows"
-            ),
-        ),
-    ],
-    indirect=True,
-)
 def test_gc_external_output(tmp_dir, dvc, workspace):
     workspace.gen({"foo": "foo", "bar": "bar"})
 
@@ -388,3 +367,34 @@ def test_gc_external_output(tmp_dir, dvc, workspace):
     assert (
         workspace / "cache" / bar_hash[:2] / bar_hash[2:]
     ).read_text() == "bar"
+
+
+def test_gc_all_experiments(tmp_dir, scm, dvc):
+    from dvc.repo.experiments.base import ExpRefInfo
+
+    (foo,) = tmp_dir.dvc_gen("foo", "foo", commit="foo")
+    foo_hash = foo.outs[0].hash_info.value
+
+    (bar,) = tmp_dir.dvc_gen("foo", "bar", commit="bar")
+    bar_hash = bar.outs[0].hash_info.value
+    baseline = scm.get_rev()
+
+    (baz,) = tmp_dir.dvc_gen("foo", "baz", commit="baz")
+    baz_hash = baz.outs[0].hash_info.value
+
+    ref = ExpRefInfo(baseline, "exp")
+    scm.set_ref(str(ref), scm.get_rev())
+
+    dvc.gc(all_experiments=True, force=True)
+
+    # all_experiments will include the experiment commit (baz) plus baseline
+    # commit (bar)
+    assert not (
+        tmp_dir / ".dvc" / "cache" / foo_hash[:2] / foo_hash[2:]
+    ).exists()
+    assert (
+        tmp_dir / ".dvc" / "cache" / bar_hash[:2] / bar_hash[2:]
+    ).read_text() == "bar"
+    assert (
+        tmp_dir / ".dvc" / "cache" / baz_hash[:2] / baz_hash[2:]
+    ).read_text() == "baz"

@@ -11,3 +11,5 @@ class StageParams:
     PARAM_PARAMS = "params"
     PARAM_METRICS = "metrics"
     PARAM_PLOTS = "plots"
+    PARAM_DESC = "desc"
+    PARAM_LIVE = "live"

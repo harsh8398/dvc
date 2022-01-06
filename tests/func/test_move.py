@@ -1,4 +1,7 @@
 import os
+import textwrap
+
+import pytest
 
 from dvc.dvcfile import DVC_FILE_SUFFIX
 from dvc.exceptions import DvcException, MoveNotDataSourceError
@@ -63,7 +66,9 @@ class TestMoveNotDataSource(TestRepro):
 
 class TestMoveFileWithExtension(TestDvc):
     def test(self):
-        with open(os.path.join(self.dvc.root_dir, "file.csv"), "w") as fd:
+        with open(
+            os.path.join(self.dvc.root_dir, "file.csv"), "w", encoding="utf-8"
+        ) as fd:
             fd.write("1,2,3\n")
 
         self.dvc.add("file.csv")
@@ -211,3 +216,55 @@ def test_should_move_to_dir_on_non_default_stage_file(tmp_dir, dvc):
     dvc.move("file", "directory")
 
     assert os.path.exists(os.path.join("directory", "file"))
+
+
+def test_move_gitignored(tmp_dir, scm, dvc):
+    from dvc.dvcfile import FileIsGitIgnored
+
+    tmp_dir.dvc_gen({"foo": "foo"})
+
+    os.mkdir("dir")
+    (tmp_dir / "dir").gen(".gitignore", "*")
+
+    with pytest.raises(FileIsGitIgnored):
+        dvc.move("foo", "dir")
+
+    assert (tmp_dir / "foo").read_text() == "foo"
+    assert (tmp_dir / "foo.dvc").exists()
+    assert not (tmp_dir / "dir" / "foo").exists()
+    assert not (tmp_dir / "dir" / "foo.dvc").exists()
+
+
+def test_move_output_overlap(tmp_dir, dvc):
+    from dvc.exceptions import OverlappingOutputPathsError
+
+    tmp_dir.dvc_gen({"foo": "foo", "dir": {"bar": "bar"}})
+
+    with pytest.raises(OverlappingOutputPathsError):
+        dvc.move("foo", "dir")
+
+    assert (tmp_dir / "foo").read_text() == "foo"
+    assert (tmp_dir / "foo.dvc").exists()
+    assert not (tmp_dir / "dir" / "foo").exists()
+    assert not (tmp_dir / "dir" / "foo.dvc").exists()
+
+
+def test_move_meta(tmp_dir, dvc):
+    (stage,) = tmp_dir.dvc_gen("foo", "foo")
+    data = (tmp_dir / stage.path).parse()
+    data["meta"] = {"custom_key": 42}
+    (tmp_dir / stage.path).dump(data)
+
+    dvc.move("foo", "bar")
+    res = (tmp_dir / "bar.dvc").read_text()
+    print(res)
+    assert res == textwrap.dedent(
+        """\
+        outs:
+        - md5: acbd18db4cc2f85cedef654fccc4a4d8
+          size: 3
+          path: bar
+        meta:
+          custom_key: 42
+    """
+    )

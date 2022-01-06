@@ -1,14 +1,13 @@
 import filecmp
 import os
 from unittest import TestCase
+from unittest.mock import patch
 
 import pytest
-from mock import patch
 
 import dvc
-from dvc.path_info import PathInfo
+from dvc.fs.local import LocalFileSystem
 from dvc.system import System
-from dvc.tree.local import LocalTree
 from dvc.utils import relpath
 from dvc.utils.fs import (
     BasePathNotInCheckedPathException,
@@ -28,9 +27,9 @@ from tests.basic_env import TestDir
 
 class TestMtimeAndSize(TestDir):
     def test(self):
-        tree = LocalTree(None, {"url": self.root_dir}, use_dvcignore=True)
-        file_time, file_size = get_mtime_and_size(self.DATA, tree)
-        dir_time, dir_size = get_mtime_and_size(self.DATA_DIR, tree)
+        fs = LocalFileSystem(url=self.root_dir)
+        file_time, file_size = get_mtime_and_size(self.DATA, fs)
+        dir_time, dir_size = get_mtime_and_size(self.DATA_DIR, fs)
 
         actual_file_size = os.path.getsize(self.DATA)
         actual_dir_size = os.path.getsize(self.DATA) + os.path.getsize(
@@ -38,11 +37,11 @@ class TestMtimeAndSize(TestDir):
         )
 
         self.assertIs(type(file_time), str)
-        self.assertIs(type(file_size), str)
-        self.assertEqual(file_size, str(actual_file_size))
+        self.assertIs(type(file_size), int)
+        self.assertEqual(file_size, actual_file_size)
         self.assertIs(type(dir_time), str)
-        self.assertIs(type(dir_size), str)
-        self.assertEqual(dir_size, str(actual_dir_size))
+        self.assertIs(type(dir_size), int)
+        self.assertEqual(dir_size, actual_dir_size)
 
 
 class TestContainsLink(TestCase):
@@ -90,9 +89,7 @@ class TestContainsLink(TestCase):
         base_path = "foo"
         target_path = os.path.join(base_path, "bar")
         self.assertFalse(contains_symlink_up_to(target_path, base_path))
-        self.assertFalse(
-            contains_symlink_up_to(PathInfo(target_path), PathInfo(base_path))
-        )
+        self.assertFalse(contains_symlink_up_to(target_path, base_path))
 
 
 def test_should_call_recursive_on_no_condition_matched(mocker):
@@ -113,41 +110,38 @@ def test_relpath_windows_different_drives():
     path2 = os.path.join("B:", os.sep, "other", "path")
     assert relpath(path1, path2) == path1
 
-    info1, info2 = PathInfo(path1), PathInfo(path2)
-    rel_info = relpath(info1, info2)
-    assert isinstance(rel_info, str)
-    assert rel_info == path1
+    rel = relpath(path1, path2)
+    assert isinstance(rel, str)
+    assert rel == path1
 
 
 def test_get_inode(tmp_dir):
     tmp_dir.gen("foo", "foo content")
 
-    assert get_inode("foo") == get_inode(PathInfo("foo"))
+    assert get_inode("foo") == get_inode("foo")
 
 
 def test_path_object_and_str_are_valid_types_get_mtime_and_size(tmp_dir):
     tmp_dir.gen(
         {"dir": {"dir_file": "dir file content"}, "file": "file_content"}
     )
-    tree = LocalTree(None, {"url": os.fspath(tmp_dir)}, use_dvcignore=True)
+    fs = LocalFileSystem(url=os.fspath(tmp_dir))
 
-    time, size = get_mtime_and_size("dir", tree)
-    object_time, object_size = get_mtime_and_size(PathInfo("dir"), tree)
+    time, size = get_mtime_and_size("dir", fs)
+    object_time, object_size = get_mtime_and_size("dir", fs)
     assert time == object_time
     assert size == object_size
 
-    time, size = get_mtime_and_size("file", tree)
-    object_time, object_size = get_mtime_and_size(PathInfo("file"), tree)
+    time, size = get_mtime_and_size("file", fs)
+    object_time, object_size = get_mtime_and_size("file", fs)
     assert time == object_time
     assert size == object_size
 
 
 def test_move(tmp_dir):
-    tmp_dir.gen({"foo": "foo content", "bar": "bar content"})
+    tmp_dir.gen({"foo": "foo content"})
     src = "foo"
-    src_info = PathInfo("bar")
     dest = os.path.join("some", "directory")
-    dest_info = PathInfo(os.path.join("some", "path-like", "directory"))
 
     os.makedirs(dest)
     assert len(os.listdir(dest)) == 0
@@ -155,23 +149,13 @@ def test_move(tmp_dir):
     assert not os.path.isfile(src)
     assert len(os.listdir(dest)) == 1
 
-    os.makedirs(dest_info)
-    assert len(os.listdir(dest_info)) == 0
-    move(src_info, dest_info)
-    assert not os.path.isfile(src_info)
-    assert len(os.listdir(dest_info)) == 1
-
 
 def test_remove(tmp_dir):
-    tmp_dir.gen({"foo": "foo content", "bar": "bar content"})
+    tmp_dir.gen({"foo": "foo content"})
     path = "foo"
-    path_info = PathInfo("bar")
 
     remove(path)
     assert not os.path.isfile(path)
-
-    remove(path_info)
-    assert not os.path.isfile(path_info)
 
 
 def test_path_isin_positive():
@@ -200,15 +184,6 @@ def test_path_isin_on_common_substring_path():
     assert not path_isin(path1, path2)
 
 
-def test_path_isin_accepts_pathinfo():
-    child = os.path.join("path", "to", "folder")
-    parent = PathInfo(child) / ".."
-
-    assert path_isin(child, parent)
-    # pylint: disable=arguments-out-of-order
-    assert not path_isin(parent, child)
-
-
 def test_path_isin_with_absolute_path():
     parent = os.path.abspath("path")
     child = os.path.join(parent, "to", "folder")
@@ -216,15 +191,33 @@ def test_path_isin_with_absolute_path():
     assert path_isin(child, parent)
 
 
+def test_path_isin_case_sensitive():
+    child = os.path.join("path", "to", "folder")
+    parent = os.path.join("PATH", "TO")
+
+    assert path_isin(child, parent) == (os.name == "nt")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows specific")
+def test_contains_symlink_case_sensitive_win():
+    child = os.path.join("path", "to", "folder")
+    parent = os.path.join("PATH", "TO")
+    assert contains_symlink_up_to(child, parent) is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Posix specific")
+def test_contains_symlink_case_sensitive_posix():
+    child = os.path.join("path", "to", "folder")
+    parent = os.path.join("PATH", "TO")
+    with pytest.raises(BasePathNotInCheckedPathException):
+        contains_symlink_up_to(child, parent)
+
+
 def test_makedirs(tmp_dir):
     path = os.path.join(tmp_dir, "directory")
-    path_info = PathInfo(os.path.join(tmp_dir, "another", "directory"))
 
     makedirs(path)
     assert os.path.isdir(path)
-
-    makedirs(path_info)
-    assert os.path.isdir(path_info)
 
 
 @pytest.mark.parametrize("path", ["file", "dir"])
@@ -232,15 +225,12 @@ def test_copyfile(path, tmp_dir):
     tmp_dir.gen(
         {
             "foo": "foo content",
-            "bar": "bar content",
             "file": "file content",
             "dir": {},
         }
     )
     src = "foo"
     dest = path
-    src_info = PathInfo("bar")
-    dest_info = PathInfo(path)
 
     copyfile(src, dest)
     if os.path.isdir(dest):
@@ -249,16 +239,6 @@ def test_copyfile(path, tmp_dir):
         )
     else:
         assert filecmp.cmp(src, dest, shallow=False)
-
-    copyfile(src_info, dest_info)
-    if os.path.isdir(dest_info):
-        assert filecmp.cmp(
-            src_info,
-            os.path.join(dest_info, os.path.basename(src_info)),
-            shallow=False,
-        )
-    else:
-        assert filecmp.cmp(src_info, dest_info, shallow=False)
 
 
 def test_copy_fobj_to_file(tmp_dir):

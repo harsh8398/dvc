@@ -3,7 +3,7 @@ import re
 
 import pytest
 
-from dvc.path_info import PathInfo
+from dvc.fs.local import LocalFileSystem
 from dvc.utils import (
     dict_sha256,
     file_md5,
@@ -86,29 +86,43 @@ def test_fix_env_pyenv(path, orig):
 def test_file_md5(tmp_dir):
     tmp_dir.gen("foo", "foo content")
 
-    assert file_md5("foo") == file_md5(PathInfo("foo"))
+    fs = LocalFileSystem()
+    assert file_md5("foo", fs) == file_md5("foo", fs)
 
 
 def test_tmp_fname():
     file_path = os.path.join("path", "to", "file")
-    file_path_info = PathInfo(file_path)
 
     def pattern(path):
         return r"^" + re.escape(path) + r"\.[a-z0-9]{22}\.tmp$"
 
     assert re.search(pattern(file_path), tmp_fname(file_path), re.IGNORECASE)
     assert re.search(
-        pattern(file_path_info.fspath),
-        tmp_fname(file_path_info),
+        pattern(file_path),
+        tmp_fname(file_path),
         re.IGNORECASE,
     )
 
 
-def test_relpath():
-    path = "path"
-    path_info = PathInfo(path)
+@pytest.mark.skipif(os.name != "nt", reason="Windows specific")
+def test_relpath_windows(monkeypatch):
+    """test that relpath correctly generated when run on a
+    windows network share. The drive mapped path is mapped
+    to a UNC path by os.path.realpath"""
 
-    assert relpath(path) == relpath(path_info)
+    def dummy_realpath(path):
+        return path.replace("x:", "\\\\server\\share")
+
+    monkeypatch.setattr(os.path, "realpath", dummy_realpath)
+    assert (
+        relpath("x:\\dir1\\dir2\\file.txt", "\\\\server\\share\\dir1")
+        == "dir2\\file.txt"
+    )
+
+    assert (
+        relpath("y:\\dir1\\dir2\\file.txt", "\\\\server\\share\\dir1")
+        == "y:\\dir1\\dir2\\file.txt"
+    )
 
 
 @pytest.mark.parametrize(
@@ -149,6 +163,31 @@ def test_resolve_output(inp, out, is_dir, expected, mocker):
         ["something.dvc:name", ("something.dvc", "name"), None],
         ["../something.dvc:name", ("../something.dvc", "name"), None],
         ["file", (None, "file"), None],
+        ["build@15", (None, "build@15"), None],
+        ["build@{'level': 35}", (None, "build@{'level': 35}"), None],
+        [":build@15", ("dvc.yaml", "build@15"), None],
+        [":build@{'level': 35}", ("dvc.yaml", "build@{'level': 35}"), None],
+        ["dvc.yaml:build@15", ("dvc.yaml", "build@15"), None],
+        [
+            "dvc.yaml:build@{'level': 35}",
+            ("dvc.yaml", "build@{'level': 35}"),
+            None,
+        ],
+        [
+            "build2@{'level': [1, 2, 3]}",
+            (None, "build2@{'level': [1, 2, 3]}"),
+            None,
+        ],
+        [
+            ":build2@{'level': [1, 2, 3]}",
+            ("dvc.yaml", "build2@{'level': [1, 2, 3]}"),
+            None,
+        ],
+        [
+            "dvc.yaml:build2@{'level': [1, 2, 3]}",
+            ("dvc.yaml", "build2@{'level': [1, 2, 3]}"),
+            None,
+        ],
     ],
 )
 def test_parse_target(inp, out, default):

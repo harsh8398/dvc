@@ -1,11 +1,12 @@
 """Manages progress bars for DVC repo."""
-
 import logging
 import sys
 from threading import RLock
 
+import fsspec
 from tqdm import tqdm
 
+from dvc.env import DVC_IGNORE_ISATTY
 from dvc.utils import env2bool
 
 logger = logging.getLogger(__name__)
@@ -31,9 +32,12 @@ class Tqdm(tqdm):
     BAR_FMT_NOTOTAL = (
         "{desc}{bar:b}|{postfix[info]}{n_fmt} [{elapsed}, {rate_fmt:>11}]"
     )
-    BYTES_DEFAULTS = dict(
-        unit="B", unit_scale=True, unit_divisor=1024, miniters=1
-    )
+    BYTES_DEFAULTS = {
+        "unit": "B",
+        "unit_scale": True,
+        "unit_divisor": 1024,
+        "miniters": 1,
+    }
 
     def __init__(
         self,
@@ -43,11 +47,11 @@ class Tqdm(tqdm):
         desc=None,
         leave=False,
         bar_format=None,
-        bytes=False,  # pylint: disable=W0622
+        bytes=False,  # pylint: disable=redefined-builtin
         file=None,
         total=None,
         postfix=None,
-        **kwargs
+        **kwargs,
     ):
         """
         bytes   : shortcut for
@@ -74,7 +78,7 @@ class Tqdm(tqdm):
         # auto-disable based on TTY
         if (
             not disable
-            and not env2bool("DVC_IGNORE_ISATTY")
+            and not env2bool(DVC_IGNORE_ISATTY)
             and hasattr(file, "isatty")
         ):
             disable = not file.isatty()
@@ -86,7 +90,7 @@ class Tqdm(tqdm):
             bar_format="!",
             lock_args=(False,),
             total=total,
-            **kwargs
+            **kwargs,
         )
         self.postfix = postfix or {"info": ""}
         if bar_format is None:
@@ -102,16 +106,19 @@ class Tqdm(tqdm):
             self.bar_format = bar_format
         self.refresh()
 
-    def update_msg(self, msg, n=1):
+    def update_msg(self, msg: str, n: int = 1) -> None:
         """
         Sets `msg` as a postfix and calls `update(n)`.
         """
-        self.postfix["info"] = " %s |" % msg
+        self.set_msg(msg)
         self.update(n)
+
+    def set_msg(self, msg: str) -> None:
+        self.postfix["info"] = f" {msg} |"
 
     def update_to(self, current, total=None):
         if total:
-            self.total = total  # pylint: disable=W0613,W0201
+            self.total = total
         self.update(current - self.n)
 
     def wrap_fn(self, fn, callback=None):
@@ -128,6 +135,9 @@ class Tqdm(tqdm):
             return res
 
         return wrapped
+
+    def as_callback(self):
+        return FsspecCallback(self)
 
     def close(self):
         self.postfix["info"] = ""
@@ -154,3 +164,49 @@ class Tqdm(tqdm):
             d["ncols_desc"] = d["ncols_info"] = 1
             d["prefix"] = ""
         return d
+
+
+class FsspecCallback(fsspec.Callback):
+    def __init__(self, progress_bar):
+        self.progress_bar = progress_bar
+        super().__init__()
+
+    def set_size(self, size):
+        if size is not None:
+            self.progress_bar.total = size
+            self.progress_bar.refresh()
+            super().set_size(size)
+
+    def relative_update(self, inc=1):
+        self.progress_bar.update(inc)
+        super().relative_update(inc)
+
+    def absolute_update(self, value):
+        self.progress_bar.update_to(value)
+        super().absolute_update(value)
+
+    @staticmethod
+    def wrap_fn(cb, fn):
+        def wrapped(*args, **kwargs):
+            res = fn(*args, **kwargs)
+            cb.relative_update()
+            return res
+
+        return wrapped
+
+
+def tdqm_or_callback_wrapped(
+    fobj, method, total, callback=None, **pbar_kwargs
+):
+    if callback:
+        from funcy import nullcontext
+        from tqdm.utils import CallbackIOWrapper
+
+        callback.set_size(total)
+        wrapper = CallbackIOWrapper(callback.relative_update, fobj, method)
+        return nullcontext(wrapper)
+
+    return Tqdm.wrapattr(fobj, method, total=total, bytes=True, **pbar_kwargs)
+
+
+DEFAULT_CALLBACK = fsspec.callbacks.NoOpCallback()

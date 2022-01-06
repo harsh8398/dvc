@@ -3,13 +3,16 @@ import textwrap
 
 import pytest
 
-from dvc.dvcfile import PIPELINE_FILE, PIPELINE_LOCK, Dvcfile, SingleStageFile
-from dvc.stage.exceptions import (
-    StageFileDoesNotExistError,
-    StageFileFormatError,
+from dvc.dvcfile import (
+    PIPELINE_FILE,
+    PIPELINE_LOCK,
+    Dvcfile,
+    ParametrizedDumpError,
+    SingleStageFile,
 )
+from dvc.stage.exceptions import StageFileDoesNotExistError
 from dvc.stage.loader import StageNotFound
-from dvc.utils.serialize import dump_yaml
+from dvc.utils.strictyaml import YAMLValidationError
 
 
 def test_run_load_one_for_multistage(tmp_dir, dvc):
@@ -158,7 +161,7 @@ def test_stage_collection(tmp_dir, dvc):
         always_changed=True,
         single_stage=True,
     )
-    assert set(dvc.stages) == {stage1, stage3, stage2}
+    assert set(dvc.index.stages) == {stage1, stage3, stage2}
 
 
 def test_remove_stage(tmp_dir, dvc, run_copy):
@@ -195,10 +198,12 @@ def test_remove_stage_lockfile(tmp_dir, dvc, run_copy):
     lock_file = dvc_file._lockfile
     assert dvc_file.exists()
     assert lock_file.exists()
-    assert {"copy-bar-foobar", "copy-foo-bar"} == set(lock_file.load().keys())
+    assert {"copy-bar-foobar", "copy-foo-bar"} == set(
+        lock_file.load()["stages"].keys()
+    )
     lock_file.remove_stage(stage)
 
-    assert ["copy-bar-foobar"] == list(lock_file.load().keys())
+    assert ["copy-bar-foobar"] == list(lock_file.load()["stages"].keys())
 
     # sanity check
     stage2.reload()
@@ -237,15 +242,15 @@ def test_remove_stage_on_lockfile_format_error(tmp_dir, dvc, run_copy):
     lock_data = lock_file.load()
     lock_data["gibberish"] = True
     data["gibberish"] = True
-    dump_yaml(lock_file.relpath, lock_data)
-    with pytest.raises(StageFileFormatError):
+    (tmp_dir / lock_file.relpath).dump(lock_data)
+    with pytest.raises(YAMLValidationError):
         dvc_file.remove_stage(stage)
 
     lock_file.remove()
     dvc_file.dump(stage, update_pipeline=False)
 
-    dump_yaml(dvc_file.relpath, data)
-    with pytest.raises(StageFileFormatError):
+    (tmp_dir / dvc_file.relpath).dump(data)
+    with pytest.raises(YAMLValidationError):
         dvc_file.remove_stage(stage)
 
 
@@ -309,12 +314,33 @@ def test_dvcfile_dump_preserves_meta(tmp_dir, dvc, run_copy):
 
     data = dvcfile._load()[0]
     metadata = {"name": "copy-file"}
+    stage.meta = metadata
     data["stages"]["run_copy"]["meta"] = metadata
-    dump_yaml(dvcfile.path, data)
 
     dvcfile.dump(stage)
     assert dvcfile._load()[0] == data
     assert dvcfile._load()[0]["stages"]["run_copy"]["meta"] == metadata
+
+
+def test_dvcfile_dump_preserves_desc(tmp_dir, dvc, run_copy):
+    tmp_dir.gen("foo", "foo")
+    stage_desc = "test stage description"
+    out_desc = "test out description"
+
+    stage = run_copy("foo", "bar", name="run_copy", desc=stage_desc)
+    dvcfile = stage.dvcfile
+
+    data = dvcfile._load()[0]
+    data["stages"]["run_copy"]["outs"][0] = {"bar": {"desc": out_desc}}
+    (tmp_dir / dvcfile.path).dump(data)
+
+    assert stage.desc == stage_desc
+    stage.outs[0].desc = out_desc
+    dvcfile.dump(stage)
+    loaded = dvcfile._load()[0]
+    assert loaded == data
+    assert loaded["stages"]["run_copy"]["desc"] == stage_desc
+    assert loaded["stages"]["run_copy"]["outs"][0]["bar"]["desc"] == out_desc
 
 
 def test_dvcfile_dump_preserves_comments(tmp_dir, dvc):
@@ -328,9 +354,31 @@ def test_dvcfile_dump_preserves_comments(tmp_dir, dvc):
             - foo"""
     )
     tmp_dir.gen("dvc.yaml", text)
-    stage = dvc.get_stage(name="generate-foo")
+    stage = dvc.stage.load_one(name="generate-foo")
     stage.outs[0].use_cache = False
     dvcfile = stage.dvcfile
 
     dvcfile.dump(stage)
     assert dvcfile._load()[1] == (text + ":\n\tcache: false\n".expandtabs())
+
+
+@pytest.mark.parametrize(
+    "data, name",
+    [
+        ({"build-us": {"cmd": "echo ${foo}"}}, "build-us"),
+        (
+            {"build": {"foreach": ["us", "gb"], "do": {"cmd": "echo ${foo}"}}},
+            "build@us",
+        ),
+    ],
+)
+def test_dvcfile_try_dumping_parametrized_stage(tmp_dir, dvc, data, name):
+    (tmp_dir / "dvc.yaml").dump({"stages": data, "vars": [{"foo": "foobar"}]})
+
+    stage = dvc.stage.load_one(name=name)
+    dvcfile = stage.dvcfile
+
+    with pytest.raises(ParametrizedDumpError) as exc:
+        dvcfile.dump(stage)
+
+    assert str(exc.value) == f"cannot dump a parametrized stage: '{name}'"

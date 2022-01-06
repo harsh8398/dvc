@@ -2,19 +2,15 @@ import logging
 import os
 import tempfile
 from contextlib import contextmanager
+from typing import TYPE_CHECKING, Optional
 
-from funcy import first
-from voluptuous import Invalid
+from funcy import cached_property, first
 
-from dvc.cache.local import _log_exceptions
 from dvc.exceptions import DvcException
-from dvc.path_info import PathInfo
-from dvc.schema import COMPILED_LOCK_FILE_STAGE_SCHEMA
 from dvc.utils import dict_sha256, relpath
-from dvc.utils.serialize import YAMLFileCorruptedError, dump_yaml, load_yaml
 
-from .loader import StageLoader
-from .serialize import to_single_stage_lockfile
+if TYPE_CHECKING:
+    from dvc.objects.db.base import ObjectDB
 
 logger = logging.getLogger(__name__)
 
@@ -25,34 +21,45 @@ class RunCacheNotFoundError(DvcException):
 
 
 def _get_cache_hash(cache, key=False):
+    from dvc.objects.meta import Meta
+
     if key:
         cache["outs"] = [out["path"] for out in cache.get("outs", [])]
-    return dict_sha256(cache)
+    return dict_sha256(cache, exclude=[Meta.PARAM_SIZE, Meta.PARAM_NFILES])
 
 
-def _get_stage_hash(stage):
-    if not (stage.cmd and stage.deps and stage.outs):
-        return None
+def _can_hash(stage):
+    if stage.is_callback or stage.always_changed:
+        return False
+
+    if not all([stage.cmd, stage.deps, stage.outs]):
+        return False
 
     for dep in stage.deps:
         if not (dep.scheme == "local" and dep.def_path and dep.get_hash()):
-            return None
+            return False
 
     for out in stage.outs:
         if out.scheme != "local" or not out.def_path or out.persist:
-            return None
+            return False
 
+    return True
+
+
+def _get_stage_hash(stage):
+    from .serialize import to_single_stage_lockfile
+
+    assert _can_hash(stage)
     return _get_cache_hash(to_single_stage_lockfile(stage), key=True)
 
 
 class StageCache:
     def __init__(self, repo):
         self.repo = repo
-        self.cache_dir = os.path.join(repo.cache.local.cache_dir, "runs")
 
-    @property
-    def tree(self):
-        return self.repo.cache.local.tree
+    @cached_property
+    def cache_dir(self):
+        return os.path.join(self.repo.odb.local.cache_dir, "runs")
 
     def _get_cache_dir(self, key):
         return os.path.join(self.cache_dir, key[:2], key)
@@ -61,6 +68,11 @@ class StageCache:
         return os.path.join(self._get_cache_dir(key), value)
 
     def _load_cache(self, key, value):
+        from voluptuous import Invalid
+
+        from dvc.schema import COMPILED_LOCK_FILE_STAGE_SCHEMA
+        from dvc.utils.serialize import YAMLFileCorruptedError, load_yaml
+
         path = self._get_cache_path(key, value)
 
         try:
@@ -90,6 +102,7 @@ class StageCache:
 
     def _create_stage(self, cache, wdir=None):
         from . import PipelineStage, create_stage
+        from .loader import StageLoader
 
         stage = create_stage(
             PipelineStage,
@@ -105,12 +118,12 @@ class StageCache:
 
     @contextmanager
     def _cache_type_copy(self):
-        cache_types = self.repo.cache.local.cache_types
-        self.repo.cache.local.cache_types = ["copy"]
+        cache_types = self.repo.odb.local.cache_types
+        self.repo.odb.local.cache_types = ["copy"]
         try:
             yield
         finally:
-            self.repo.cache.local.cache_types = cache_types
+            self.repo.odb.local.cache_types = cache_types
 
     def _uncached_outs(self, stage, cache):
         # NOTE: using temporary stage to avoid accidentally modifying original
@@ -129,10 +142,12 @@ class StageCache:
                     yield out
 
     def save(self, stage):
-        cache_key = _get_stage_hash(stage)
-        if not cache_key:
+        from .serialize import to_single_stage_lockfile
+
+        if not _can_hash(stage):
             return
 
+        cache_key = _get_stage_hash(stage)
         cache = to_single_stage_lockfile(stage)
         cache_value = _get_cache_hash(cache)
 
@@ -145,19 +160,25 @@ class StageCache:
         if existing_cache:
             return
 
+        from dvc.schema import COMPILED_LOCK_FILE_STAGE_SCHEMA
+        from dvc.utils.serialize import dump_yaml
+
         # sanity check
         COMPILED_LOCK_FILE_STAGE_SCHEMA(cache)
 
-        path = PathInfo(self._get_cache_path(cache_key, cache_value))
-        self.tree.makedirs(path.parent)
-        tmp = tempfile.NamedTemporaryFile(delete=False, dir=path.parent).name
-        assert os.path.exists(path.parent)
-        assert os.path.isdir(path.parent)
+        path = self._get_cache_path(cache_key, cache_value)
+        parent = self.repo.odb.local.fs.path.parent(path)
+        self.repo.odb.local.makedirs(parent)
+        tmp = tempfile.NamedTemporaryFile(delete=False, dir=parent).name
+        assert os.path.exists(parent)
+        assert os.path.isdir(parent)
         dump_yaml(tmp, cache)
-        self.tree.move(PathInfo(tmp), path)
+        self.repo.odb.local.move(tmp, path)
 
     def restore(self, stage, run_cache=True, pull=False):
-        if stage.is_callback or stage.always_changed:
+        from .serialize import to_single_stage_lockfile
+
+        if not _can_hash(stage):
             raise RunCacheNotFoundError(stage)
 
         if (
@@ -177,7 +198,8 @@ class StageCache:
         cached_stage = self._create_stage(cache, wdir=stage.wdir)
 
         if pull:
-            self.repo.cloud.pull(cached_stage.get_used_cache())
+            for objs in cached_stage.get_used_objs().values():
+                self.repo.cloud.pull(objs)
 
         if not cached_stage.outs_cached():
             raise RunCacheNotFoundError(stage)
@@ -192,47 +214,58 @@ class StageCache:
     def _transfer(func, from_remote, to_remote):
         ret = []
 
-        runs = from_remote.path_info / "runs"
-        if not from_remote.exists(runs):
+        runs = from_remote.fs.path.join(from_remote.fs_path, "runs")
+        if not from_remote.fs.exists(runs):
             return []
 
-        for src in from_remote.walk_files(runs):
-            rel = src.relative_to(from_remote.path_info)
-            dst = to_remote.path_info / rel
-            key = dst.parent
+        from_path = from_remote.fs.path
+        for src in from_remote.fs.find(runs):
+            rel = from_path.relpath(src, from_remote.fs_path)
+            dst = to_remote.fs.path.join(to_remote.fs_path, rel)
+            key = to_remote.fs.path.parent(dst)
             # check if any build cache already exists for this key
-            if to_remote.exists(key) and first(to_remote.walk_files(key)):
+            # TODO: check if MaxKeys=1 or something like that applies
+            # or otherwise this will take a lot of time!
+            if to_remote.fs.exists(key) and first(to_remote.fs.find(key)):
                 continue
             func(src, dst)
-            ret.append((src.parent.name, src.name))
+            ret.append(
+                (from_path.name(from_path.parent(src)), from_path.name(src))
+            )
 
         return ret
 
-    def push(self, remote):
-        remote = self.repo.cloud.get_remote(remote)
+    def push(self, remote: Optional[str], odb: Optional["ObjectDB"] = None):
+        from dvc.objects.transfer import _log_exceptions
+
+        if odb is None:
+            odb = self.repo.cloud.get_remote_odb(remote)
         return self._transfer(
-            _log_exceptions(remote.tree.upload, "upload"),
-            self.repo.cache.local.tree,
-            remote.tree,
+            _log_exceptions(odb.fs.upload),
+            self.repo.odb.local,
+            odb,
         )
 
-    def pull(self, remote):
-        remote = self.repo.cloud.get_remote(remote)
+    def pull(self, remote: Optional[str]):
+        from dvc.objects.transfer import _log_exceptions
+
+        odb = self.repo.cloud.get_remote_odb(remote)
         return self._transfer(
-            _log_exceptions(remote.tree.download, "download"),
-            remote.tree,
-            self.repo.cache.local.tree,
+            _log_exceptions(odb.fs.download),
+            odb,
+            self.repo.odb.local,
         )
 
-    def get_used_cache(self, used_run_cache, *args, **kwargs):
-        from dvc.cache import NamedCache
+    def get_used_objs(self, used_run_cache, *args, **kwargs):
+        """Return used cache for the specified run-cached stages."""
+        from collections import defaultdict
 
-        cache = NamedCache()
-
+        used_objs = defaultdict(set)
         for key, value in used_run_cache:
             entry = self._load_cache(key, value)
             if not entry:
                 continue
             stage = self._create_stage(entry)
-            cache.update(stage.get_used_cache(*args, **kwargs))
-        return cache
+            for odb, objs in stage.get_used_objs(*args, **kwargs).items():
+                used_objs[odb].update(objs)
+        return used_objs

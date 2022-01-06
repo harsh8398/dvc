@@ -5,7 +5,7 @@ from . import locked
 
 @locked
 def _destroy_stages(repo):
-    for stage in repo.stages:
+    for stage in repo.index.stages:
         stage.unprotect_outs()
         stage.dvcfile.remove(force=True)
 
@@ -14,4 +14,5 @@ def _destroy_stages(repo):
 # which will cause issues on Windows, as `.dvc/lock` will be busy.
 def destroy(repo):
     _destroy_stages(repo)
+    repo.close()
     remove(repo.dvc_dir)

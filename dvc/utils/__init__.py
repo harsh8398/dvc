@@ -9,10 +9,9 @@ import re
 import stat
 import sys
 import time
+from typing import Dict, List, Optional, Tuple
 
 import colorama
-import nanotime
-from shortuuid import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -42,46 +41,34 @@ def _fobj_md5(fobj, hash_md5, binary, progress_func=None):
             progress_func(len(data))
 
 
-def file_md5(fname, tree=None):
-    """ get the (md5 hexdigest, md5 digest) of a file """
+def file_md5(fname, fs):
+    """get the (md5 hexdigest, md5 digest) of a file"""
     from dvc.istextfile import istextfile
     from dvc.progress import Tqdm
 
-    if tree:
-        exists_func = tree.exists
-        stat_func = tree.stat
-        open_func = tree.open
-    else:
-        exists_func = os.path.exists
-        stat_func = os.stat
-        open_func = open
+    hash_md5 = hashlib.md5()
+    binary = not istextfile(fname, fs=fs)
+    size = fs.getsize(fname) or 0
+    no_progress_bar = True
+    if size >= LARGE_FILE_SIZE:
+        no_progress_bar = False
+        msg = (
+            f"Computing md5 for a large file '{fname}'. "
+            "This is only done once."
+        )
+        logger.info(msg)
 
-    if exists_func(fname):
-        hash_md5 = hashlib.md5()
-        binary = not istextfile(fname, tree=tree)
-        size = stat_func(fname).st_size
-        no_progress_bar = True
-        if size >= LARGE_FILE_SIZE:
-            no_progress_bar = False
-            msg = (
-                "Computing md5 for a large file '{}'. This is only done once."
-            )
-            logger.info(msg.format(relpath(fname)))
-        name = relpath(fname)
+    with Tqdm(
+        desc=str(fname),
+        disable=no_progress_bar,
+        total=size,
+        bytes=True,
+        leave=False,
+    ) as pbar:
+        with fs.open(fname, "rb") as fobj:
+            _fobj_md5(fobj, hash_md5, binary, pbar.update)
 
-        with Tqdm(
-            desc=name,
-            disable=no_progress_bar,
-            total=size,
-            bytes=True,
-            leave=False,
-        ) as pbar:
-            with open_func(fname, "rb") as fobj:
-                _fobj_md5(fobj, hash_md5, binary, pbar.update)
-
-        return (hash_md5.hexdigest(), hash_md5.digest())
-
-    return (None, None)
+    return hash_md5.hexdigest()
 
 
 def bytes_hash(byts, typ):
@@ -94,18 +81,15 @@ def dict_filter(d, exclude=()):
     """
     Exclude specified keys from a nested dict
     """
+    if not exclude or not isinstance(d, (list, dict)):
+        return d
 
     if isinstance(d, list):
         return [dict_filter(e, exclude) for e in d]
 
-    if isinstance(d, dict):
-        return {
-            k: dict_filter(v, exclude)
-            for k, v in d.items()
-            if k not in exclude
-        }
-
-    return d
+    return {
+        k: dict_filter(v, exclude) for k, v in d.items() if k not in exclude
+    }
 
 
 def dict_hash(d, typ, exclude=()):
@@ -227,29 +211,40 @@ def fix_env(env=None):
     return env
 
 
-def tmp_fname(fname):
-    """ Temporary name for a partial download """
+def tmp_fname(fname=""):
+    """Temporary name for a partial download"""
+    from shortuuid import uuid
+
     return os.fspath(fname) + "." + uuid() + ".tmp"
 
 
 def current_timestamp():
+    import nanotime
+
     return int(nanotime.timestamp(time.time()))
 
 
-def colorize(message, color=None):
+def colorize(message, color=None, style=None):
     """Returns a message in a specified color."""
     if not color:
         return message
+
+    styles = {"dim": colorama.Style.DIM, "bold": colorama.Style.BRIGHT}
 
     colors = {
         "green": colorama.Fore.GREEN,
         "yellow": colorama.Fore.YELLOW,
         "blue": colorama.Fore.BLUE,
         "red": colorama.Fore.RED,
+        "magenta": colorama.Fore.MAGENTA,
+        "cyan": colorama.Fore.CYAN,
     }
 
-    return "{color}{message}{nc}".format(
-        color=colors.get(color, ""), message=message, nc=colorama.Fore.RESET
+    return "{style}{color}{message}{reset}".format(
+        style=styles.get(style, ""),
+        color=colors.get(color, ""),
+        message=message,
+        reset=colorama.Style.RESET_ALL,
     )
 
 
@@ -321,10 +316,19 @@ def relpath(path, start=os.curdir):
     start = os.path.abspath(os.fspath(start))
 
     # Windows path on different drive than curdir doesn't have relpath
-    if os.name == "nt" and not os.path.commonprefix(
-        [start, os.path.abspath(path)]
-    ):
-        return path
+    if os.name == "nt":
+        # Since python 3.8 os.realpath resolves network shares to their UNC
+        # path. So, to be certain that relative paths correctly captured,
+        # we need to resolve to UNC path first. We resolve only the drive
+        # name so that we don't follow any 'real' symlinks on the path
+        def resolve_network_drive_windows(path_to_resolve):
+            drive, tail = os.path.splitdrive(path_to_resolve)
+            return os.path.join(os.path.realpath(drive), tail)
+
+        path = resolve_network_drive_windows(os.path.abspath(path))
+        start = resolve_network_drive_windows(start)
+        if not os.path.commonprefix([start, path]):
+            return path
     return os.path.relpath(path, start)
 
 
@@ -339,40 +343,63 @@ def env2bool(var, undefined=False):
 
 
 def resolve_output(inp, out):
+    import errno
     from urllib.parse import urlparse
 
     name = os.path.basename(os.path.normpath(urlparse(inp).path))
     if not out:
-        return name
-    if os.path.isdir(out):
-        return os.path.join(out, name)
-    return out
+        ret = name
+    elif os.path.isdir(out):
+        ret = os.path.join(out, name)
+    else:
+        ret = out
+
+    if os.path.exists(ret):
+        raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), ret)
+
+    return ret
 
 
-def resolve_paths(repo, out):
+def resolve_paths(repo, out, always_local=False):
     from urllib.parse import urlparse
 
+    from dvc.fs.local import localfs
+
     from ..dvcfile import DVC_FILE_SUFFIX
-    from ..path_info import PathInfo
+    from ..exceptions import DvcException
+    from ..system import System
     from .fs import contains_symlink_up_to
 
-    abspath = PathInfo(os.path.abspath(out))
+    abspath = os.path.abspath(out)
     dirname = os.path.dirname(abspath)
     base = os.path.basename(os.path.normpath(out))
 
     scheme = urlparse(out).scheme
-    if os.name == "nt" and scheme == abspath.drive[0].lower():
+
+    if os.name == "nt" and scheme == os.path.splitdrive(abspath)[0][0].lower():
         # urlparse interprets windows drive letters as URL scheme
         scheme = ""
-    if (
-        not scheme
-        and abspath.isin_or_eq(repo.root_dir)
-        and not contains_symlink_up_to(abspath, repo.root_dir)
+
+    if scheme or not localfs.path.isin_or_eq(abspath, repo.root_dir):
+        wdir = os.getcwd()
+    elif contains_symlink_up_to(dirname, repo.root_dir) or (
+        os.path.isdir(abspath) and System.is_symlink(abspath)
     ):
+        msg = (
+            "Cannot add files inside symlinked directories to DVC. "
+            "See {} for more information."
+        ).format(
+            format_link(
+                "https://dvc.org/doc/user-guide/troubleshooting#add-symlink"
+            )
+        )
+        raise DvcException(msg)
+    else:
         wdir = dirname
         out = base
-    else:
-        wdir = os.getcwd()
+
+    if always_local:
+        out = base
 
     path = os.path.join(wdir, base + DVC_FILE_SUFFIX)
 
@@ -389,21 +416,35 @@ def error_link(name):
     return format_link(f"https://error.dvc.org/{name}")
 
 
-def parse_target(target, default=None):
+def parse_target(
+    target: str, default: str = None, isa_glob: bool = False
+) -> Tuple[Optional[str], Optional[str]]:
     from dvc.dvcfile import PIPELINE_FILE, PIPELINE_LOCK, is_valid_filename
     from dvc.exceptions import DvcException
+    from dvc.parsing import JOIN
 
     if not target:
         return None, None
 
-    match = TARGET_REGEX.match(target)
+    default = default or PIPELINE_FILE
+    if isa_glob:
+        path, _, glob = target.rpartition(":")
+        return path or default, glob or None
+
+    # look for first "@", so as not to assume too much about stage name
+    # eg: it might contain ":" in a generated stages from dict which might
+    # affect further parsing with the regex.
+    group, _, key = target.partition(JOIN)
+    match = TARGET_REGEX.match(group)
+
     if not match:
         return target, None
 
-    path, name = (
-        match.group("path"),
-        match.group("name"),
-    )
+    path, name = (match.group("path"), match.group("name"))
+
+    if name and key:
+        name += f"{JOIN}{key}"
+
     if path:
         if os.path.basename(path) == PIPELINE_LOCK:
             raise DvcException(
@@ -416,11 +457,57 @@ def parse_target(target, default=None):
             return ret if is_valid_filename(target) else ret[::-1]
 
     if not path:
-        path = default or PIPELINE_FILE
-        logger.debug("Assuming file to be '%s'", path)
+        logger.trace(  # type: ignore[attr-defined]
+            "Assuming file to be '%s'", default
+        )
 
-    return path, name
+    return path or default, name
 
 
 def is_exec(mode):
-    return mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return bool(mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))
+
+
+def glob_targets(targets, glob=True, recursive=True):
+    if not glob:
+        return targets
+
+    from glob import iglob
+
+    return [
+        exp_target
+        for target in targets
+        for exp_target in iglob(target, recursive=recursive)
+    ]
+
+
+def error_handler(func):
+    def wrapper(*args, **kwargs):
+        onerror = kwargs.get("onerror", None)
+        result = {}
+
+        try:
+            vals = func(*args, **kwargs)
+            if vals:
+                result["data"] = vals
+        except Exception as e:  # pylint: disable=broad-except
+            if onerror is not None:
+                onerror(result, e, **kwargs)
+        return result
+
+    return wrapper
+
+
+def onerror_collect(result: Dict, exception: Exception, *args, **kwargs):
+    logger.debug("", exc_info=True)
+    result["error"] = exception
+
+
+def errored_revisions(rev_data: Dict) -> List:
+    from dvc.utils.collections import nested_contains
+
+    result = []
+    for revision, data in rev_data.items():
+        if nested_contains(data, "error"):
+            result.append(revision)
+    return result

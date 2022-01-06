@@ -1,7 +1,4 @@
 """Exceptions raised by the dvc."""
-from funcy import first
-
-from dvc.utils import error_link, format_link, relpath
 
 
 class DvcException(Exception):
@@ -9,6 +6,7 @@ class DvcException(Exception):
 
     def __init__(self, msg, *args):
         assert msg
+        self.msg = msg
         super().__init__(msg, *args)
 
 
@@ -26,6 +24,8 @@ class OutputDuplicationError(DvcException):
     """
 
     def __init__(self, output, stages):
+        from funcy import first
+
         assert isinstance(output, str)
         assert all(hasattr(stage, "relpath") for stage in stages)
         if len(stages) == 1:
@@ -34,7 +34,7 @@ class OutputDuplicationError(DvcException):
             )
         else:
             msg = "output '{}' is already specified in stages:\n{}".format(
-                output, "\n".join(f"\t- {s.addressing}" for s in stages),
+                output, "\n".join(f"\t- {s.addressing}" for s in stages)
             )
         super().__init__(msg)
         self.stages = stages
@@ -42,17 +42,19 @@ class OutputDuplicationError(DvcException):
 
 
 class OutputNotFoundError(DvcException):
-    """Thrown if a file/directory not found in repository pipelines.
+    """Thrown if a file/directory is not found as an output in any pipeline.
 
     Args:
         output (unicode): path to the file/directory.
     """
 
     def __init__(self, output, repo=None):
+        from dvc.utils import relpath
+
         self.output = output
         self.repo = repo
         super().__init__(
-            "Unable to find DVC-file with output '{path}'".format(
+            "Unable to find DVC file with output '{path}'".format(
                 path=relpath(self.output)
             )
         )
@@ -105,7 +107,7 @@ class ArgumentDuplicationError(DvcException):
 
 
 class MoveNotDataSourceError(DvcException):
-    """Thrown if attempted to move a file/directory that is not an output
+    """Thrown when trying to move a file/directory that is not an output
     in a data source stage.
 
     Args:
@@ -164,21 +166,9 @@ class BadMetricError(DvcException):
     def __init__(self, paths):
         super().__init__(
             "the following metrics do not exist, "
-            "are not metric files or are malformed: {paths}".format(
+            "are not metrics files or are malformed: {paths}".format(
                 paths=", ".join(f"'{path}'" for path in paths)
             )
-        )
-
-
-class NoMetricsError(DvcException):
-    pass
-
-
-class NoPlotsError(DvcException):
-    def __init__(self):
-        super().__init__(
-            "no plots in this repository. Use `--plots/--plots-no-cache` "
-            "options for `dvc run` to mark stage outputs as plots."
         )
 
 
@@ -226,39 +216,34 @@ class DvcIgnoreInCollectedDirError(DvcException):
         )
 
 
-class GitHookAlreadyExistsError(DvcException):
-    def __init__(self, hook_name):
-        super().__init__(
-            "Hook '{}' already exists. Please refer to {} for more "
-            "info.".format(
-                hook_name, format_link("https://man.dvc.org/install")
-            )
-        )
+class FileTransferError(DvcException):
+    _METHOD = "transfer"
 
-
-class DownloadError(DvcException):
     def __init__(self, amount):
         self.amount = amount
 
-        super().__init__(f"{amount} files failed to download")
+        super().__init__(f"{amount} files failed to {self._METHOD}")
 
 
-class UploadError(DvcException):
-    def __init__(self, amount):
-        self.amount = amount
+class DownloadError(FileTransferError):
+    _METHOD = "download"
 
-        super().__init__(f"{amount} files failed to upload")
+
+class UploadError(FileTransferError):
+    _METHOD = "upload"
 
 
 class CheckoutError(DvcException):
     def __init__(self, target_infos, stats=None):
+        from dvc.utils import error_link
+
         self.target_infos = target_infos
         self.stats = stats
         targets = [str(t) for t in target_infos]
         m = (
             "Checkout failed for following targets:\n{}\nIs your "
             "cache up to date?\n{}".format(
-                "\n".join(targets), error_link("missing-files"),
+                "\n".join(targets), error_link("missing-files")
             )
         )
         super().__init__(m)
@@ -277,6 +262,8 @@ class NoRemoteInExternalRepoError(DvcException):
 
 class NoOutputInExternalRepoError(DvcException):
     def __init__(self, path, external_repo_path, external_repo_url):
+        from dvc.utils import relpath
+
         super().__init__(
             "Output '{}' not found in target repository '{}'".format(
                 relpath(path, external_repo_path), external_repo_url
@@ -306,15 +293,17 @@ class PathMissingError(DvcException):
 
 
 class RemoteCacheRequiredError(DvcException):
-    def __init__(self, path_info):
+    def __init__(self, scheme, fs_path):
+        from dvc.utils import format_link
+
         super().__init__(
             (
                 "Current operation was unsuccessful because '{}' requires "
                 "existing cache on '{}' remote. See {} for information on how "
                 "to set up remote cache."
             ).format(
-                path_info,
-                path_info.scheme,
+                fs_path,
+                scheme,
                 format_link("https://man.dvc.org/config#cache"),
             )
         )
@@ -338,3 +327,33 @@ class NoOutputOrStageError(DvcException):
 
 class MergeError(DvcException):
     pass
+
+
+class CacheLinkError(DvcException):
+    from dvc.utils import format_link
+
+    SUPPORT_LINK = "See {} for more information.".format(
+        format_link(
+            "https://dvc.org/doc/user-guide/troubleshooting#cache-types"
+        )
+    )
+
+    def __init__(self, fs_paths):
+        msg = "No possible cache link types for '{}'. {}".format(
+            ", ".join(fs_paths), self.SUPPORT_LINK
+        )
+        super().__init__(msg)
+        self.fs_paths = fs_paths
+
+
+class CircularImportError(DvcException):
+    def __init__(self, dep, a, b):
+        super().__init__(
+            f"'{dep}' contains invalid circular import. "
+            f"DVC repo '{a}' already imports from '{b}'."
+        )
+
+
+class PrettyDvcException(DvcException):
+    def __pretty_exc__(self, **kwargs):
+        """Print prettier exception message."""

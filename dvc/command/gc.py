@@ -2,8 +2,8 @@ import argparse
 import logging
 import os
 
-import dvc.prompt as prompt
 from dvc.command.base import CmdBase, append_doc_link
+from dvc.ui import ui
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,8 @@ class CmdGC(CmdBase):
             msg += " and all git branches"
         elif self.args.all_tags:
             msg += " and all git tags"
+        elif self.args.all_experiments:
+            msg += " and all experiments"
 
         if self.args.repos:
             msg += " of the current and the following repos:"
@@ -42,13 +44,14 @@ class CmdGC(CmdBase):
         logger.warning(msg)
 
         msg = "Are you sure you want to proceed?"
-        if not self.args.force and not prompt.confirm(msg):
+        if not self.args.force and not ui.confirm(msg):
             return 1
 
         self.repo.gc(
             all_branches=self.args.all_branches,
             all_tags=self.args.all_tags,
             all_commits=self.args.all_commits,
+            all_experiments=self.args.all_experiments,
             cloud=self.args.cloud,
             remote=self.args.remote,
             force=self.args.force,
@@ -94,10 +97,17 @@ def add_parser(subparsers, parent_parser):
         help="Keep data files for all Git tags.",
     )
     gc_parser.add_argument(
+        "-A",
         "--all-commits",
         action="store_true",
         default=False,
         help="Keep data files for all Git commits.",
+    )
+    gc_parser.add_argument(
+        "--all-experiments",
+        action="store_true",
+        default=False,
+        help="Keep data files for all experiments.",
     )
     gc_parser.add_argument(
         "-c",

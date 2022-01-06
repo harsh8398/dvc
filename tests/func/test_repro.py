@@ -3,9 +3,9 @@ import os
 import re
 import shutil
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
-from mock import patch
 
 from dvc.dvcfile import DVC_FILE, Dvcfile
 from dvc.exceptions import (
@@ -13,12 +13,12 @@ from dvc.exceptions import (
     ReproductionError,
     StagePathAsOutputError,
 )
+from dvc.fs.local import LocalFileSystem
 from dvc.main import main
-from dvc.output.base import BaseOutput
+from dvc.output import Output
 from dvc.stage import Stage
 from dvc.stage.exceptions import StageFileDoesNotExistError
 from dvc.system import System
-from dvc.tree.local import LocalTree
 from dvc.utils import file_md5, relpath
 from dvc.utils.fs import remove
 from dvc.utils.serialize import dump_yaml, load_yaml
@@ -169,10 +169,12 @@ class TestReproWorkingDirectoryAsOutput(TestDvc):
 
         # NOTE: os.walk() walks in a sorted order and we need dir2 subdirs to
         # be processed before dir1 to load error.dvc first.
-        self.dvc.stages = [
-            nested_stage,
-            Dvcfile(self.dvc, error_stage_path).stage,
-        ]
+        self.dvc.index = self.dvc.index.update(
+            [
+                nested_stage,
+                Dvcfile(self.dvc, error_stage_path).stage,
+            ]
+        )
 
         with patch.object(self.dvc, "_reset"):  # to prevent `stages` resetting
             with self.assertRaises(StagePathAsOutputError):
@@ -266,28 +268,6 @@ class TestReproDepDirWithOutputsUnderIt(SingleStageRun, TestDvc):
         self.assertEqual(len(stages), 2)
 
 
-class TestReproNoDeps(TestRepro):
-    def test(self):
-        out = "out"
-        code_file = "out.py"
-        stage_file = "out.dvc"
-        code = (
-            'import uuid\nwith open("{}", "w+") as fd:\n'
-            "\tfd.write(str(uuid.uuid4()))\n".format(out)
-        )
-        with open(code_file, "w+") as fd:
-            fd.write(code)
-        stage = self._run(
-            fname=stage_file,
-            outs=[out],
-            cmd=f"python {code_file}",
-            name="uuid",
-        )
-
-        stages = self.dvc.reproduce(self._get_stage_target(stage))
-        self.assertEqual(len(stages), 1)
-
-
 class TestReproForce(TestRepro):
     def test(self):
         stages = self.dvc.reproduce(
@@ -363,7 +343,7 @@ class TestReproDryNoExec(TestDvc):
             os.mkdir(idir)
 
             f = os.path.join(idir, "file")
-            with open(f, "w+") as fobj:
+            with open(f, "w+", encoding="utf-8") as fobj:
                 fobj.write(str(d))
 
             ret = main(
@@ -463,7 +443,7 @@ class TestReproForceDownstream(TestDvc):
         )
         self.assertTrue(file3_stage is not None)
 
-        with open(code2, "a") as fobj:
+        with open(code2, "a", encoding="utf-8") as fobj:
             fobj.write("\n\n")
 
         stages = self.dvc.reproduce(file3_stage.path, force_downstream=True)
@@ -572,11 +552,10 @@ class TestReproFrozenCallback(SingleStageRun, TestDvc):
     def test(self):
         file1 = "file1"
         file1_stage = file1 + ".dvc"
-        # NOTE: purposefully not specifying dependencies
+        # NOTE: purposefully not specifying deps or outs
         # to create a callback stage.
         stage = self._run(
             fname=file1_stage,
-            outs=[file1],
             cmd=f"python {self.CODE} {self.FOO} {file1}",
             name="copy-FOO-file1",
         )
@@ -675,7 +654,7 @@ class TestReproDataSource(TestReproChangedData):
 
         self.assertTrue(filecmp.cmp(self.FOO, self.BAR, shallow=False))
         self.assertEqual(
-            stages[0].outs[0].hash_info.value, file_md5(self.BAR)[0]
+            stages[0].outs[0].hash_info.value, file_md5(self.BAR, self.dvc.fs)
         )
 
 
@@ -691,7 +670,7 @@ class TestReproChangedDir(SingleStageRun, TestDvc):
             'shutil.copyfile("{}", os.path.join("{}", "{}"))'
         )
 
-        with open(dir_code, "w+") as fd:
+        with open(dir_code, "w+", encoding="utf-8") as fd:
             fd.write(code.format(dir_name, file_name, dir_name, file_name))
 
         stage = self._run(
@@ -717,7 +696,7 @@ class TestReproChangedDirData(SingleStageRun, TestDvc):
         dir_name = "dir"
         dir_code = "dir_code.py"
 
-        with open(dir_code, "w+") as fd:
+        with open(dir_code, "w+", encoding="utf-8") as fd:
             fd.write(
                 "import os; import sys; import shutil; "
                 "shutil.copytree(sys.argv[1], sys.argv[2])"
@@ -736,7 +715,7 @@ class TestReproChangedDirData(SingleStageRun, TestDvc):
         stages = self.dvc.reproduce(target)
         self.assertEqual(len(stages), 0)
 
-        with open(self.DATA_SUB, "a") as fd:
+        with open(self.DATA_SUB, "a", encoding="utf-8") as fd:
             fd.write("add")
 
         stages = self.dvc.reproduce(target)
@@ -759,8 +738,8 @@ class TestReproChangedDirData(SingleStageRun, TestDvc):
 class TestReproMissingMd5InStageFile(TestRepro):
     def test(self):
         d = load_yaml(self.file1_stage)
-        del d[Stage.PARAM_OUTS][0][LocalTree.PARAM_CHECKSUM]
-        del d[Stage.PARAM_DEPS][0][LocalTree.PARAM_CHECKSUM]
+        del d[Stage.PARAM_OUTS][0][LocalFileSystem.PARAM_CHECKSUM]
+        del d[Stage.PARAM_DEPS][0][LocalFileSystem.PARAM_CHECKSUM]
         dump_yaml(self.file1_stage, d)
 
         stages = self.dvc.reproduce(self.file1_stage)
@@ -781,45 +760,6 @@ class TestCmdRepro(TestReproChangedData):
         self.assertNotEqual(ret, 0)
 
 
-class TestCmdReproChdir(TestDvc):
-    def test(self):
-        dname = "dir"
-        os.mkdir(dname)
-        foo = os.path.join(dname, self.FOO)
-        bar = os.path.join(dname, self.BAR)
-        code = os.path.join(dname, self.CODE)
-        shutil.copyfile(self.FOO, foo)
-        shutil.copyfile(self.CODE, code)
-
-        ret = main(
-            [
-                "run",
-                "--single-stage",
-                "--file",
-                f"{dname}/Dvcfile",
-                "-w",
-                f"{dname}",
-                "-d",
-                self.FOO,
-                "-o",
-                self.BAR,
-                f"python {self.CODE} {self.FOO} {self.BAR}",
-            ]
-        )
-        self.assertEqual(ret, 0)
-        self.assertTrue(os.path.isfile(foo))
-        self.assertTrue(os.path.isfile(bar))
-        self.assertTrue(filecmp.cmp(foo, bar, shallow=False))
-
-        os.unlink(bar)
-
-        ret = main(["repro", "-c", dname, DVC_FILE])
-        self.assertEqual(ret, 0)
-        self.assertTrue(os.path.isfile(foo))
-        self.assertTrue(os.path.isfile(bar))
-        self.assertTrue(filecmp.cmp(foo, bar, shallow=False))
-
-
 class TestReproShell(TestDvc):
     def test(self):
         if os.name == "nt":
@@ -835,14 +775,14 @@ class TestReproShell(TestDvc):
             single_stage=True,
         )
 
-        with open(fname) as fd:
+        with open(fname, encoding="utf-8") as fd:
             self.assertEqual(os.getenv("SHELL"), fd.read().strip())
 
         os.unlink(fname)
 
         self.dvc.reproduce(stage)
 
-        with open(fname) as fd:
+        with open(fname, encoding="utf-8") as fd:
             self.assertEqual(os.getenv("SHELL"), fd.read().strip())
 
 
@@ -891,18 +831,19 @@ class TestReproAllPipelines(SingleStageRun, TestDvc):
 
 class TestReproNoCommit(TestRepro):
     def test(self):
-        remove(self.dvc.cache.local.cache_dir)
+        remove(self.dvc.odb.local.cache_dir)
         ret = main(
             ["repro", self._get_stage_target(self.stage), "--no-commit"]
         )
         self.assertEqual(ret, 0)
-        self.assertEqual(os.listdir(self.dvc.cache.local.cache_dir), ["runs"])
+        self.assertEqual(os.listdir(self.dvc.odb.local.cache_dir), ["runs"])
 
 
 class TestReproAlreadyCached(TestRepro):
     def test(self):
         stage = self._run(
             fname="datetime.dvc",
+            always_changed=True,
             deps=[],
             outs=["datetime.txt"],
             cmd='python -c "import time; print(time.time())" > datetime.txt',
@@ -932,20 +873,21 @@ class TestReproAlreadyCached(TestRepro):
         self.assertNotEqual(run_out.hash_info, repro_out.hash_info)
 
     def test_force_import(self):
+        remove(self.BAR)
         ret = main(["import-url", self.FOO, self.BAR])
         self.assertEqual(ret, 0)
 
         patch_download = patch.object(
-            LocalTree,
+            LocalFileSystem,
             "download",
-            side_effect=LocalTree.download,
+            side_effect=LocalFileSystem.download,
             autospec=True,
         )
 
         patch_checkout = patch.object(
-            BaseOutput,
+            Output,
             "checkout",
-            side_effect=BaseOutput.checkout,
+            side_effect=Output.checkout,
             autospec=True,
         )
 
@@ -974,6 +916,7 @@ class TestShouldDisplayMetricsOnReproWithMetricsOption(TestDvc):
         self.assertEqual(0, ret)
 
         self._caplog.clear()
+        self._capsys.readouterr()  # clearing the buffer
 
         from dvc.dvcfile import DVC_FILE_SUFFIX
 
@@ -982,8 +925,9 @@ class TestShouldDisplayMetricsOnReproWithMetricsOption(TestDvc):
         )
         self.assertEqual(0, ret)
 
-        expected_metrics_display = f"{metrics_file}: {metrics_value}"
-        self.assertIn(expected_metrics_display, self._caplog.text)
+        expected_metrics_display = f"Path\n{metrics_file}  {metrics_value}\n"
+        actual, _ = self._capsys.readouterr()
+        self.assertIn(expected_metrics_display, actual)
 
 
 @pytest.fixture
@@ -1069,11 +1013,11 @@ def _rewrite_file(path_elements, new_content):
         path_elements = [path_elements]
     file = Path(os.sep.join(path_elements))
     file.unlink()
-    file.write_text(new_content)
+    file.write_text(new_content, encoding="utf-8")
 
 
 def _read_out(stage):
-    return Path(stage.outs[0].fspath).read_text()
+    return Path(stage.outs[0].fspath).read_text(encoding="utf-8")
 
 
 def test_recursive_repro_default(dvc, repro_dir):
@@ -1183,7 +1127,16 @@ def test_dvc_formatting_retained(tmp_dir, dvc, run_copy):
     (tmp_dir / "foo").write_text("new foo")
     dvc.reproduce("foo_copy.dvc", force=True)
 
-    assert _hide_md5(stage_text) == _hide_md5(stage_path.read_text())
+    def _hide_md5(text):
+        return re.sub(r"\b[a-f0-9]{32}\b", "<md5>", text)
+
+    def _hide_size(text):
+        return re.sub(r"size: [0-9]*\b", "size: <size>", text)
+
+    def _mask(text):
+        return _hide_size(_hide_md5(text))
+
+    assert _mask(stage_text) == _mask(stage_path.read_text())
 
 
 def _format_dvc_line(line):
@@ -1191,15 +1144,10 @@ def _format_dvc_line(line):
     if "cache:" in line or "md5:" in line:
         return line + " # line comment"
     # Format command as one word per line
-    elif line.startswith("cmd: "):
+    if line.startswith("cmd: "):
         pre, command = line.split(None, 1)
         return pre + " >\n" + "\n".join("  " + s for s in command.split())
-    else:
-        return line
-
-
-def _hide_md5(text):
-    return re.sub(r"\b[a-f0-9]{32}\b", "<md5>", text)
+    return line
 
 
 def test_downstream(dvc):
@@ -1296,10 +1244,12 @@ def test_repro_when_cmd_changes(tmp_dir, dvc, run_copy, mocker):
 
     data = SingleStageFile(dvc, stage.path)._load()[0]
     data["cmd"] = "  ".join(stage.cmd.split())  # change cmd spacing by two
-    dump_yaml(stage.path, data)
+    (tmp_dir / stage.path).dump(data)
 
     assert dvc.status([stage.addressing]) == {
         stage.addressing: ["changed checksum"]
     }
     assert dvc.reproduce(stage.addressing)[0] == stage
-    m.assert_called_once_with(stage, checkpoint=False)
+    m.assert_called_once_with(
+        stage, checkpoint_func=None, dry=False, run_env=None
+    )

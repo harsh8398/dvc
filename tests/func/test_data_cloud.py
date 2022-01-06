@@ -5,129 +5,16 @@ import shutil
 import pytest
 from flaky.flaky_decorator import flaky
 
-from dvc.cache import NamedCache
-from dvc.cache.base import (
-    STATUS_DELETED,
-    STATUS_MISSING,
-    STATUS_NEW,
-    STATUS_OK,
-)
+import dvc as dvc_module
 from dvc.external_repo import clean_repos
 from dvc.main import main
 from dvc.stage.exceptions import StageNotFound
-from dvc.tree.local import LocalTree
-from dvc.utils.fs import move, remove
-from dvc.utils.serialize import dump_yaml, load_yaml
-
-all_clouds = [
-    pytest.lazy_fixture(cloud)
-    for cloud in ["s3", "gs", "azure", "gdrive", "ssh", "http", "hdfs"]
-] + [
-    pytest.param(
-        pytest.lazy_fixture("oss"),
-        marks=pytest.mark.xfail(
-            reason="https://github.com/iterative/dvc/issues/4633",
-        ),
-    )
-]
+from dvc.testing.test_remote import (  # noqa, pylint: disable=unused-import
+    TestRemote,
+)
+from dvc.utils.fs import remove
 
 
-@pytest.mark.parametrize("remote", all_clouds, indirect=True)
-def test_cloud(tmp_dir, dvc, remote):  # pylint:disable=unused-argument
-    (stage,) = tmp_dir.dvc_gen("foo", "foo")
-    out = stage.outs[0]
-    cache = out.cache_path
-    md5 = out.hash_info.value
-    info = out.get_used_cache()
-
-    (stage_dir,) = tmp_dir.dvc_gen(
-        {
-            "data_dir": {
-                "data_sub_dir": {"data_sub": "data_sub"},
-                "data": "data",
-                "empty": "",
-            }
-        }
-    )
-    out_dir = stage_dir.outs[0]
-    cache_dir = out_dir.cache_path
-    name_dir = str(out_dir)
-    md5_dir = out_dir.hash_info.value
-    info_dir = NamedCache.make(out_dir.scheme, md5_dir, name_dir)
-
-    with dvc.state:
-        # Check status
-        status = dvc.cloud.status(info, show_checksums=True)
-        expected = {md5: {"name": md5, "status": STATUS_NEW}}
-        assert status == expected
-
-        status_dir = dvc.cloud.status(info_dir, show_checksums=True)
-        expected = {md5_dir: {"name": md5_dir, "status": STATUS_NEW}}
-        assert status_dir == expected
-
-        # Move cache and check status
-        # See issue https://github.com/iterative/dvc/issues/4383 for details
-        backup_dir = dvc.cache.local.cache_dir + ".backup"
-        move(dvc.cache.local.cache_dir, backup_dir)
-        status = dvc.cloud.status(info, show_checksums=True)
-        expected = {md5: {"name": md5, "status": STATUS_MISSING}}
-        assert status == expected
-
-        status_dir = dvc.cloud.status(info_dir, show_checksums=True)
-        expected = {md5_dir: {"name": md5_dir, "status": STATUS_MISSING}}
-        assert status_dir == expected
-
-        # Restore original cache:
-        remove(dvc.cache.local.cache_dir)
-        move(backup_dir, dvc.cache.local.cache_dir)
-
-        # Push and check status
-        dvc.cloud.push(info)
-        assert os.path.exists(cache)
-        assert os.path.isfile(cache)
-
-        dvc.cloud.push(info_dir)
-        assert os.path.isfile(cache_dir)
-
-        status = dvc.cloud.status(info, show_checksums=True)
-        expected = {md5: {"name": md5, "status": STATUS_OK}}
-        assert status == expected
-
-        status_dir = dvc.cloud.status(info_dir, show_checksums=True)
-        expected = {md5_dir: {"name": md5_dir, "status": STATUS_OK}}
-        assert status_dir == expected
-
-        # Remove and check status
-        remove(dvc.cache.local.cache_dir)
-
-        status = dvc.cloud.status(info, show_checksums=True)
-        expected = {md5: {"name": md5, "status": STATUS_DELETED}}
-        assert status == expected
-
-        status_dir = dvc.cloud.status(info_dir, show_checksums=True)
-        expected = {md5_dir: {"name": md5_dir, "status": STATUS_DELETED}}
-        assert status_dir == expected
-
-        # Pull and check status
-        dvc.cloud.pull(info)
-        assert os.path.exists(cache)
-        assert os.path.isfile(cache)
-        with open(cache) as fd:
-            assert fd.read() == "foo"
-
-        dvc.cloud.pull(info_dir)
-        assert os.path.isfile(cache_dir)
-
-        status = dvc.cloud.status(info, show_checksums=True)
-        expected = {md5: {"name": md5, "status": STATUS_OK}}
-        assert status == expected
-
-        status_dir = dvc.cloud.status(info_dir, show_checksums=True)
-        expected = {md5_dir: {"name": md5_dir, "status": STATUS_OK}}
-        assert status_dir == expected
-
-
-@pytest.mark.parametrize("remote", all_clouds, indirect=True)
 def test_cloud_cli(tmp_dir, dvc, remote):
     args = ["-v", "-j", "2"]
 
@@ -153,7 +40,7 @@ def test_cloud_cli(tmp_dir, dvc, remote):
     assert os.path.isfile(cache)
     assert os.path.isfile(cache_dir)
 
-    remove(dvc.cache.local.cache_dir)
+    remove(dvc.odb.local.cache_dir)
 
     assert main(["fetch"] + args) == 0
     assert os.path.exists(cache)
@@ -167,7 +54,7 @@ def test_cloud_cli(tmp_dir, dvc, remote):
     assert os.path.isfile("foo")
     assert os.path.isdir("data_dir")
 
-    with open(cache) as fd:
+    with open(cache, encoding="utf-8") as fd:
         assert fd.read() == "foo"
     assert os.path.isfile(cache_dir)
 
@@ -177,9 +64,7 @@ def test_cloud_cli(tmp_dir, dvc, remote):
 
     # NOTE: check if remote gc works correctly on directories
     assert main(["gc", "-cw", "-f"] + args) == 0
-    shutil.move(
-        dvc.cache.local.cache_dir, dvc.cache.local.cache_dir + ".back",
-    )
+    shutil.move(dvc.odb.local.cache_dir, dvc.odb.local.cache_dir + ".back")
 
     assert main(["fetch"] + args) == 0
 
@@ -204,9 +89,9 @@ def test_warn_on_outdated_stage(tmp_dir, dvc, local_remote, caplog):
     assert main(["push"]) == 0
 
     stage_file_path = stage.relpath
-    content = load_yaml(stage_file_path)
+    content = (tmp_dir / stage_file_path).parse()
     del content["outs"][0]["md5"]
-    dump_yaml(stage_file_path, content)
+    (tmp_dir / stage_file_path).dump(content)
 
     with caplog.at_level(logging.WARNING, logger="dvc"):
         caplog.clear()
@@ -222,7 +107,7 @@ def test_warn_on_outdated_stage(tmp_dir, dvc, local_remote, caplog):
 
 def test_hash_recalculation(mocker, dvc, tmp_dir, local_remote):
     tmp_dir.gen({"foo": "foo"})
-    test_get_file_hash = mocker.spy(LocalTree, "get_file_hash")
+    test_file_md5 = mocker.spy(dvc_module.objects.stage, "file_md5")
     ret = main(["config", "cache.type", "hardlink"])
     assert ret == 0
     ret = main(["add", "foo"])
@@ -231,14 +116,17 @@ def test_hash_recalculation(mocker, dvc, tmp_dir, local_remote):
     assert ret == 0
     ret = main(["run", "--single-stage", "-d", "foo", "echo foo"])
     assert ret == 0
-    assert test_get_file_hash.mock.call_count == 1
+    assert test_file_md5.mock.call_count == 1
 
 
 def test_missing_cache(tmp_dir, dvc, local_remote, caplog):
+    from tests.utils import clean_staging
+
     tmp_dir.dvc_gen({"foo": "foo", "bar": "bar"})
 
     # purge cache
-    remove(dvc.cache.local.cache_dir)
+    remove(dvc.odb.local.cache_dir)
+    clean_staging()
 
     header = (
         "Some of the cache files do not exist "
@@ -260,7 +148,10 @@ def test_missing_cache(tmp_dir, dvc, local_remote, caplog):
     assert bar in caplog.text
 
     caplog.clear()
-    assert dvc.status(cloud=True) == {"bar": "missing", "foo": "missing"}
+    assert dvc.status(cloud=True) == {
+        "bar": "missing",
+        "foo": "missing",
+    }
     assert header not in caplog.text
     assert foo not in caplog.text
     assert bar not in caplog.text
@@ -276,15 +167,15 @@ def test_verify_hashes(
     # remove artifacts and cache to trigger fetching
     remove("file")
     remove("dir")
-    remove(dvc.cache.local.cache_dir)
+    remove(dvc.odb.local.cache_dir)
 
-    hash_spy = mocker.spy(dvc.cache.local.tree, "get_file_hash")
+    hash_spy = mocker.spy(dvc_module.objects.stage, "file_md5")
 
     dvc.pull()
     assert hash_spy.call_count == 0
 
     # Removing cache will invalidate existing state entries
-    remove(dvc.cache.local.cache_dir)
+    remove(dvc.odb.local.cache_dir)
 
     dvc.config["remote"]["upstream"]["verify"] = True
 
@@ -306,12 +197,12 @@ def test_pull_git_imports(tmp_dir, dvc, scm, erepo):
 
     assert dvc.pull()["fetched"] == 0
 
-    for item in ["foo", "new_dir", dvc.cache.local.cache_dir]:
+    for item in ["foo", "new_dir", dvc.odb.local.cache_dir]:
         remove(item)
-    os.makedirs(dvc.cache.local.cache_dir, exist_ok=True)
+    os.makedirs(dvc.odb.local.cache_dir, exist_ok=True)
     clean_repos()
 
-    assert dvc.pull(force=True)["fetched"] == 2
+    assert dvc.pull(force=True)["fetched"] == 3
 
     assert (tmp_dir / "foo").exists()
     assert (tmp_dir / "foo").read_text() == "foo"
@@ -344,15 +235,39 @@ def test_pull_external_dvc_imports(tmp_dir, dvc, scm, erepo_dir):
     assert (tmp_dir / "new_dir" / "bar").read_text() == "bar"
 
 
+def test_pull_external_dvc_imports_mixed(
+    tmp_dir, dvc, scm, erepo_dir, local_remote
+):
+    with erepo_dir.chdir():
+        erepo_dir.dvc_gen("foo", "foo", commit="first")
+        os.remove("foo")
+
+    # imported: foo
+    dvc.imp(os.fspath(erepo_dir), "foo")
+
+    # local-object: bar
+    tmp_dir.dvc_gen("bar", "bar")
+    dvc.push("bar")
+
+    clean(["foo", "bar"], dvc)
+
+    assert dvc.pull()["fetched"] == 2
+    assert (tmp_dir / "foo").read_text() == "foo"
+    assert (tmp_dir / "bar").read_text() == "bar"
+
+
 def clean(outs, dvc=None):
+    from tests.utils import clean_staging
+
     if dvc:
-        outs = outs + [dvc.cache.local.cache_dir]
+        outs = outs + [dvc.odb.local.cache_dir]
     for path in outs:
         print(path)
         remove(path)
     if dvc:
-        os.makedirs(dvc.cache.local.cache_dir, exist_ok=True)
+        os.makedirs(dvc.odb.local.cache_dir, exist_ok=True)
         clean_repos()
+        clean_staging()
 
 
 def recurse_list_dir(d):
@@ -421,7 +336,7 @@ def test_pipeline_file_target_ops(tmp_dir, dvc, run_copy, local_remote):
     assert set(dvc.pull()["added"]) == set(outs)
 
     # clean everything in remote and push
-    from tests.dir_helpers import TmpDir
+    from dvc.testing.tmp_dir import TmpDir
 
     clean(TmpDir(path).iterdir())
     dvc.push(["dvc.yaml:copy-ipsum-baz"])
@@ -446,13 +361,12 @@ def test_pipeline_file_target_ops(tmp_dir, dvc, run_copy, local_remote):
         ({}, "Everything is up to date"),
     ],
 )
-def test_push_stats(tmp_dir, dvc, fs, msg, caplog, local_remote):
+def test_push_stats(tmp_dir, dvc, fs, msg, capsys, local_remote):
     tmp_dir.dvc_gen(fs)
 
-    caplog.clear()
-    with caplog.at_level(level=logging.INFO, logger="dvc"):
-        main(["push"])
-    assert msg in caplog.text
+    main(["push"])
+    out, _ = capsys.readouterr()
+    assert msg in out
 
 
 @pytest.mark.parametrize(
@@ -463,32 +377,34 @@ def test_push_stats(tmp_dir, dvc, fs, msg, caplog, local_remote):
         ({}, "Everything is up to date."),
     ],
 )
-def test_fetch_stats(tmp_dir, dvc, fs, msg, caplog, local_remote):
+def test_fetch_stats(tmp_dir, dvc, fs, msg, capsys, local_remote):
     tmp_dir.dvc_gen(fs)
     dvc.push()
     clean(list(fs.keys()), dvc)
-    caplog.clear()
-    with caplog.at_level(level=logging.INFO, logger="dvc"):
-        main(["fetch"])
-    assert msg in caplog.text
+
+    main(["fetch"])
+    out, _ = capsys.readouterr()
+    assert msg in out
 
 
-def test_pull_stats(tmp_dir, dvc, caplog, local_remote):
+def test_pull_stats(tmp_dir, dvc, capsys, local_remote):
     tmp_dir.dvc_gen({"foo": "foo", "bar": "bar"})
     dvc.push()
     clean(["foo", "bar"], dvc)
     (tmp_dir / "bar").write_text("foobar")
-    caplog.clear()
-    with caplog.at_level(level=logging.INFO, logger="dvc"):
-        main(["pull", "--force"])
-    assert "M\tbar" in caplog.text
-    assert "A\tfoo" in caplog.text
-    assert "2 files fetched" in caplog.text
-    assert "1 file added" in caplog.text
-    assert "1 file modified" in caplog.text
-    with caplog.at_level(level=logging.INFO, logger="dvc"):
-        main(["pull"])
-    assert "Everything is up to date." in caplog.text
+
+    assert main(["pull", "--force"]) == 0
+
+    out, _ = capsys.readouterr()
+    assert "M\tbar".expandtabs() in out
+    assert "A\tfoo".expandtabs() in out
+    assert "2 files fetched" in out
+    assert "1 file added" in out
+    assert "1 file modified" in out
+
+    main(["pull"])
+    out, _ = capsys.readouterr()
+    assert "Everything is up to date." in out
 
 
 @pytest.mark.parametrize(
@@ -523,8 +439,92 @@ def test_push_pull_fetch_pipeline_stages(tmp_dir, dvc, run_copy, local_remote):
 
     dvc.pull("copy-foo-bar")
     assert (tmp_dir / "bar").exists()
-    assert len(recurse_list_dir(dvc.cache.local.cache_dir)) == 1
+    assert len(recurse_list_dir(dvc.odb.local.cache_dir)) == 1
     clean(["bar"], dvc)
 
     dvc.fetch("copy-foo-bar")
-    assert len(recurse_list_dir(dvc.cache.local.cache_dir)) == 1
+    assert len(recurse_list_dir(dvc.odb.local.cache_dir)) == 1
+
+
+def test_pull_partial(tmp_dir, dvc, local_remote):
+    tmp_dir.dvc_gen({"foo": {"bar": {"baz": "baz"}, "spam": "spam"}})
+    dvc.push()
+    clean(["foo"], dvc)
+
+    stats = dvc.pull(os.path.join("foo", "bar"))
+    assert stats["fetched"] == 1
+    assert (tmp_dir / "foo").read_text() == {"bar": {"baz": "baz"}}
+
+
+def test_output_remote(tmp_dir, dvc, make_remote):
+    make_remote("default", default=True)
+    make_remote("for_foo", default=False)
+    make_remote("for_data", default=False)
+
+    tmp_dir.dvc_gen("foo", "foo")
+    tmp_dir.dvc_gen("bar", "bar")
+    tmp_dir.dvc_gen("data", {"one": "one", "two": "two"})
+
+    with (tmp_dir / "foo.dvc").modify() as d:
+        d["outs"][0]["remote"] = "for_foo"
+
+    with (tmp_dir / "data.dvc").modify() as d:
+        d["outs"][0]["remote"] = "for_data"
+
+    dvc.push()
+
+    default = dvc.cloud.get_remote_odb("default")
+    for_foo = dvc.cloud.get_remote_odb("for_foo")
+    for_data = dvc.cloud.get_remote_odb("for_data")
+
+    assert set(default.all()) == {"37b51d194a7513e45b56f6524f2d51f2"}
+    assert set(for_foo.all()) == {"acbd18db4cc2f85cedef654fccc4a4d8"}
+    assert set(for_data.all()) == {
+        "f97c5d29941bfb1b2fdab0874906ab82",
+        "6b18131dc289fd37006705affe961ef8.dir",
+        "b8a9f715dbb64fd5c56e7783c6820a61",
+    }
+
+    clean(["foo", "bar", "data"], dvc)
+
+    dvc.pull()
+
+    assert set(dvc.odb.local.all()) == {
+        "37b51d194a7513e45b56f6524f2d51f2",
+        "acbd18db4cc2f85cedef654fccc4a4d8",
+        "f97c5d29941bfb1b2fdab0874906ab82",
+        "6b18131dc289fd37006705affe961ef8.dir",
+        "b8a9f715dbb64fd5c56e7783c6820a61",
+    }
+
+
+def test_target_remote(tmp_dir, dvc, make_remote):
+    make_remote("default", default=True)
+    make_remote("myremote", default=False)
+
+    tmp_dir.dvc_gen("foo", "foo")
+    tmp_dir.dvc_gen("data", {"one": "one", "two": "two"})
+
+    dvc.push(remote="myremote")
+
+    default = dvc.cloud.get_remote_odb("default")
+    myremote = dvc.cloud.get_remote_odb("myremote")
+
+    assert set(default.all()) == set()
+    assert set(myremote.all()) == {
+        "acbd18db4cc2f85cedef654fccc4a4d8",
+        "f97c5d29941bfb1b2fdab0874906ab82",
+        "6b18131dc289fd37006705affe961ef8.dir",
+        "b8a9f715dbb64fd5c56e7783c6820a61",
+    }
+
+    clean(["foo", "data"], dvc)
+
+    dvc.pull(remote="myremote")
+
+    assert set(dvc.odb.local.all()) == {
+        "acbd18db4cc2f85cedef654fccc4a4d8",
+        "f97c5d29941bfb1b2fdab0874906ab82",
+        "6b18131dc289fd37006705affe961ef8.dir",
+        "b8a9f715dbb64fd5c56e7783c6820a61",
+    }

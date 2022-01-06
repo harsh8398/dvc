@@ -1,70 +1,149 @@
 import logging
+import os
+from collections import defaultdict
+from copy import copy
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple
 
 from dvc.dependency.param import ParamsDependency
-from dvc.exceptions import DvcException
-from dvc.path_info import PathInfo
 from dvc.repo import locked
-from dvc.utils.serialize import LOADERS, ParseError
+from dvc.repo.collect import collect
+from dvc.scm import NoSCMError
+from dvc.stage import PipelineStage
+from dvc.ui import ui
+from dvc.utils import error_handler, errored_revisions, onerror_collect
+from dvc.utils.serialize import LOADERS
+
+if TYPE_CHECKING:
+    from dvc.output import Output
+    from dvc.repo import Repo
 
 logger = logging.getLogger(__name__)
 
 
-class NoParamsError(DvcException):
-    pass
+def _is_params(dep: "Output"):
+    return isinstance(dep, ParamsDependency)
 
 
-def _collect_configs(repo):
-    configs = set()
-    configs.add(PathInfo(repo.root_dir) / ParamsDependency.DEFAULT_PARAMS_FILE)
-    for stage in repo.stages:
-        for dep in stage.deps:
-            if not isinstance(dep, ParamsDependency):
-                continue
+def _collect_configs(
+    repo: "Repo", rev, targets=None
+) -> Tuple[List["Output"], List[str]]:
 
-            configs.add(dep.path_info)
-    return list(configs)
+    params, fs_paths = collect(
+        repo,
+        targets=targets or [],
+        deps=True,
+        output_filter=_is_params,
+        rev=rev,
+    )
+    all_fs_paths = fs_paths + [p.fs_path for p in params]
+    if not targets:
+        default_params = os.path.join(
+            repo.root_dir, ParamsDependency.DEFAULT_PARAMS_FILE
+        )
+        if default_params not in all_fs_paths and repo.fs.exists(
+            default_params
+        ):
+            fs_paths.append(default_params)
+    return params, fs_paths
 
 
-def _read_params(repo, configs, rev):
-    res = {}
-    for config in configs:
-        if not repo.tree.exists(config):
-            continue
+@error_handler
+def _read_fs_path(fs, fs_path, **kwargs):
+    suffix = fs.path.suffix(fs_path).lower()
+    loader = LOADERS[suffix]
+    return loader(fs_path, fs=fs)
 
-        suffix = config.suffix.lower()
-        loader = LOADERS[suffix]
-        try:
-            res[str(config)] = loader(config, tree=repo.tree)
-        except ParseError:
-            logger.debug(
-                "failed to read '%s' on '%s'", config, rev, exc_info=True
-            )
-            continue
+
+def _read_params(
+    repo,
+    params,
+    params_fs_paths,
+    deps=False,
+    onerror: Optional[Callable] = None,
+):
+    res: Dict[str, Dict] = defaultdict(dict)
+    fs_paths = copy(params_fs_paths)
+
+    if deps:
+        for param in params:
+            params_dict = error_handler(param.read_params_d)(onerror=onerror)
+            if params_dict:
+                res[
+                    repo.fs.path.relpath(param.fs_path, os.getcwd())
+                ] = params_dict
+    else:
+        fs_paths += [param.fs_path for param in params]
+
+    for fs_path in fs_paths:
+        from_path = _read_fs_path(repo.fs, fs_path, onerror=onerror)
+        if from_path:
+            res[repo.fs.path.relpath(fs_path, os.getcwd())] = from_path
 
     return res
 
 
+def _collect_vars(repo, params) -> Dict:
+    vars_params: Dict[str, Dict] = defaultdict(dict)
+    for stage in repo.index.stages:
+        if isinstance(stage, PipelineStage) and stage.tracked_vars:
+            for file, vars_ in stage.tracked_vars.items():
+                # `params` file are shown regardless of `tracked` or not
+                # to reduce noise and duplication, they are skipped
+                if file in params:
+                    continue
+
+                vars_params[file].update(vars_)
+    return vars_params
+
+
 @locked
-def show(repo, revs=None):
+def show(repo, revs=None, targets=None, deps=False, onerror: Callable = None):
+    if onerror is None:
+        onerror = onerror_collect
     res = {}
 
     for branch in repo.brancher(revs=revs):
-        configs = _collect_configs(repo)
-        params = _read_params(repo, configs, branch)
+        params = error_handler(_gather_params)(
+            repo=repo, rev=branch, targets=targets, deps=deps, onerror=onerror
+        )
 
         if params:
             res[branch] = params
 
-    if not res:
-        raise NoParamsError("no parameter configs files in this repository")
-
     # Hide workspace params if they are the same as in the active branch
     try:
         active_branch = repo.scm.active_branch()
-    except TypeError:
-        pass  # Detached head
+    except (TypeError, NoSCMError):
+        # TypeError - detached head
+        # NoSCMError - no repo case
+        pass
     else:
         if res.get("workspace") == res.get(active_branch):
             res.pop("workspace", None)
 
+    errored = errored_revisions(res)
+    if errored:
+        ui.error_write(
+            "DVC failed to load some parameters for following revisions:"
+            f" '{', '.join(errored)}'."
+        )
+
     return res
+
+
+def _gather_params(repo, rev, targets=None, deps=False, onerror=None):
+    param_outs, params_fs_paths = _collect_configs(repo, rev, targets=targets)
+    params = _read_params(
+        repo,
+        params=param_outs,
+        params_fs_paths=params_fs_paths,
+        deps=deps,
+        onerror=onerror,
+    )
+    vars_params = _collect_vars(repo, params)
+
+    # NOTE: only those that are not added as a ParamDependency are
+    # included so we don't need to recursively merge them yet.
+    for key, vals in vars_params.items():
+        params[key]["data"] = vals
+    return params

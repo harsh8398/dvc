@@ -1,67 +1,39 @@
-import pytest
+import ssl
 
-from dvc.exceptions import HTTPError
-from dvc.tree.http import HTTPTree
+from mock import patch
 
-
-def test_download_fails_on_error_code(dvc, http):
-    tree = HTTPTree(dvc, http.config)
-
-    with pytest.raises(HTTPError):
-        tree._download(http / "missing.txt", "missing.txt")
+from dvc.fs.http import HTTPFileSystem
 
 
 def test_public_auth_method(dvc):
     config = {
         "url": "http://example.com/",
-        "path_info": "file.html",
+        "path": "file.html",
         "user": "",
         "password": "",
     }
 
-    tree = HTTPTree(dvc, config)
+    fs = HTTPFileSystem(**config)
 
-    assert tree._auth_method() is None
+    assert "auth" not in fs.fs_args["client_kwargs"]
+    assert "headers" not in fs.fs_args
 
 
 def test_basic_auth_method(dvc):
-    from requests.auth import HTTPBasicAuth
-
     user = "username"
     password = "password"
-    auth = HTTPBasicAuth(user, password)
     config = {
         "url": "http://example.com/",
-        "path_info": "file.html",
+        "path": "file.html",
         "auth": "basic",
         "user": user,
         "password": password,
     }
 
-    tree = HTTPTree(dvc, config)
+    fs = HTTPFileSystem(**config)
 
-    assert tree._auth_method() == auth
-    assert isinstance(tree._auth_method(), HTTPBasicAuth)
-
-
-def test_digest_auth_method(dvc):
-    from requests.auth import HTTPDigestAuth
-
-    user = "username"
-    password = "password"
-    auth = HTTPDigestAuth(user, password)
-    config = {
-        "url": "http://example.com/",
-        "path_info": "file.html",
-        "auth": "digest",
-        "user": user,
-        "password": password,
-    }
-
-    tree = HTTPTree(dvc, config)
-
-    assert tree._auth_method() == auth
-    assert isinstance(tree._auth_method(), HTTPDigestAuth)
+    assert fs.fs_args["client_kwargs"]["auth"].login == user
+    assert fs.fs_args["client_kwargs"]["auth"].password == password
 
 
 def test_custom_auth_method(dvc):
@@ -69,59 +41,53 @@ def test_custom_auth_method(dvc):
     password = "password"
     config = {
         "url": "http://example.com/",
-        "path_info": "file.html",
+        "path": "file.html",
         "auth": "custom",
         "custom_auth_header": header,
         "password": password,
     }
 
-    tree = HTTPTree(dvc, config)
+    fs = HTTPFileSystem(**config)
 
-    assert tree._auth_method() is None
-    assert header in tree.headers
-    assert tree.headers[header] == password
-
-
-def test_ssl_verify_is_enabled_by_default(dvc):
-    config = {
-        "url": "http://example.com/",
-        "path_info": "file.html",
-    }
-
-    tree = HTTPTree(dvc, config)
-
-    assert tree._session.verify is True
+    headers = fs.fs_args["headers"]
+    assert header in headers
+    assert headers[header] == password
 
 
 def test_ssl_verify_disable(dvc):
     config = {
         "url": "http://example.com/",
-        "path_info": "file.html",
+        "path": "file.html",
         "ssl_verify": False,
     }
 
-    tree = HTTPTree(dvc, config)
+    fs = HTTPFileSystem(**config)
+    assert not fs.fs_args["client_kwargs"]["connector"]._ssl
 
-    assert tree._session.verify is False
+
+@patch("ssl.SSLContext.load_verify_locations")
+def test_ssl_verify_custom_cert(dvc, mocker):
+    config = {
+        "url": "http://example.com/",
+        "path": "file.html",
+        "ssl_verify": "/path/to/custom/cabundle.pem",
+    }
+
+    fs = HTTPFileSystem(**config)
+
+    assert isinstance(
+        fs.fs_args["client_kwargs"]["connector"]._ssl, ssl.SSLContext
+    )
 
 
 def test_http_method(dvc):
-    from requests.auth import HTTPBasicAuth
-
-    user = "username"
-    password = "password"
-    auth = HTTPBasicAuth(user, password)
     config = {
         "url": "http://example.com/",
-        "path_info": "file.html",
-        "auth": "basic",
-        "user": user,
-        "password": password,
-        "method": "PUT",
+        "path": "file.html",
     }
 
-    tree = HTTPTree(dvc, config)
+    fs = HTTPFileSystem(**config, method="PUT")
+    assert fs.upload_method == "PUT"
 
-    assert tree._auth_method() == auth
-    assert tree.method == "PUT"
-    assert isinstance(tree._auth_method(), HTTPBasicAuth)
+    fs = HTTPFileSystem(**config, method="POST")
+    assert fs.upload_method == "POST"

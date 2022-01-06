@@ -79,32 +79,14 @@ def diff(old, new, with_unchanged=False):
 
     res = defaultdict(dict)
     for path in paths:
-        path_diff = _diff(old.get(path), new.get(path), with_unchanged)
+        path_diff = _diff(
+            old.get(path, {}).get("data", {}),
+            new.get(path, {}).get("data", {}),
+            with_unchanged,
+        )
         if path_diff:
             res[path] = path_diff
     return dict(res)
-
-
-def table(header, rows, markdown=False):
-    from tabulate import tabulate
-
-    if not rows and not markdown:
-        return ""
-
-    ret = tabulate(
-        rows,
-        header,
-        tablefmt="github" if markdown else "plain",
-        disable_numparse=True,
-        # None will be shown as "" by default, overriding
-        missingval="—",
-    )
-
-    if markdown:
-        # NOTE: md table is incomplete without the trailing newline
-        ret += "\n"
-
-    return ret
 
 
 def format_dict(d):

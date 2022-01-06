@@ -1,9 +1,38 @@
 import argparse
 import logging
 
+import colorama
+
+from dvc import analytics
 from dvc.command.base import CmdBaseNoRepo, append_doc_link
+from dvc.utils import boxify
+from dvc.utils import format_link as fmt_link
 
 logger = logging.getLogger(__name__)
+
+
+def _welcome_message():
+    from dvc.ui import ui
+
+    if analytics.is_enabled():
+        ui.write(
+            boxify(
+                "DVC has enabled anonymous aggregate usage analytics.\n"
+                "Read the analytics documentation (and how to opt-out) here:\n"
+                + fmt_link("https://dvc.org/doc/user-guide/analytics"),
+                border_color="red",
+            )
+        )
+
+    msg = (
+        "{yellow}What's next?{nc}\n"
+        "{yellow}------------{nc}\n"
+        f"- Check out the documentation: {fmt_link('https://dvc.org/doc')}\n"
+        f"- Get help and share ideas: {fmt_link('https://dvc.org/chat')}\n"
+        f"- Star us on GitHub: {fmt_link('https://github.com/iterative/dvc')}"
+    ).format(yellow=colorama.Fore.YELLOW, nc=colorama.Fore.RESET)
+
+    ui.write(msg)
 
 
 class CmdInit(CmdBaseNoRepo):
@@ -12,13 +41,14 @@ class CmdInit(CmdBaseNoRepo):
         from dvc.repo import Repo
 
         try:
-            self.repo = Repo.init(
+            with Repo.init(
                 ".",
                 no_scm=self.args.no_scm,
                 force=self.args.force,
                 subdir=self.args.subdir,
-            )
-            self.config = self.repo.config
+            ) as repo:
+                self.config = repo.config
+                _welcome_message()
         except InitError:
             logger.exception("failed to initiate DVC")
             return 1

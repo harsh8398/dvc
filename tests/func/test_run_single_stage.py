@@ -4,8 +4,8 @@ import os
 import textwrap
 import uuid
 from pathlib import Path
+from unittest import mock
 
-import mock
 import pytest
 
 from dvc.dependency.base import DependencyIsStageFileError
@@ -19,8 +19,7 @@ from dvc.exceptions import (
     StagePathAsOutputError,
 )
 from dvc.main import main
-from dvc.output import BaseOutput
-from dvc.output.base import OutputIsStageFileError
+from dvc.output import Output, OutputIsStageFileError
 from dvc.repo import Repo as DvcRepo
 from dvc.stage import Stage
 from dvc.stage.exceptions import (
@@ -60,7 +59,9 @@ class TestRun(TestDvc):
         self.assertEqual(len(stage.deps), len(deps))
         self.assertEqual(len(stage.outs), len(outs + outs_no_cache))
         self.assertEqual(stage.outs[0].fspath, outs[0])
-        self.assertEqual(stage.outs[0].hash_info.value, file_md5(self.FOO)[0])
+        self.assertEqual(
+            stage.outs[0].hash_info.value, file_md5(self.FOO, self.dvc.fs)
+        )
         self.assertTrue(stage.path, fname)
 
         with self.assertRaises(OutputDuplicationError):
@@ -111,7 +112,7 @@ class TestRunNoExec(TestDvcGit):
             single_stage=True,
         )
         self.assertFalse(os.path.exists("out"))
-        with open(".gitignore") as fobj:
+        with open(".gitignore", encoding="utf-8") as fobj:
             self.assertEqual(fobj.read(), "/out\n")
 
 
@@ -268,10 +269,8 @@ class TestRunBadWdir(TestDvc):
             path = os.path.join(self._root_dir, str(uuid.uuid4()))
             os.mkdir(path)
             path = os.path.join(path, str(uuid.uuid4()))
-            open(path, "a").close()
-            self.dvc.run(
-                cmd="command", wdir=path, single_stage=True,
-            )
+            open(path, "a", encoding="utf-8").close()
+            self.dvc.run(cmd="command", wdir=path, single_stage=True)
 
 
 class TestRunBadName(TestDvc):
@@ -305,7 +304,7 @@ class TestRunBadName(TestDvc):
 
 class TestRunRemoveOuts(TestDvc):
     def test(self):
-        with open(self.CODE, "w+") as fobj:
+        with open(self.CODE, "w+", encoding="utf-8") as fobj:
             fobj.write("import sys\n")
             fobj.write("import os\n")
             fobj.write("if os.path.exists(sys.argv[1]):\n")
@@ -322,7 +321,7 @@ class TestRunRemoveOuts(TestDvc):
 
 class TestRunUnprotectOutsCopy(TestDvc):
     def test(self):
-        with open(self.CODE, "w+") as fobj:
+        with open(self.CODE, "w+", encoding="utf-8") as fobj:
             fobj.write("import sys\n")
             fobj.write("with open(sys.argv[1], 'a+') as fobj:\n")
             fobj.write("    fobj.write('foo')\n")
@@ -345,7 +344,7 @@ class TestRunUnprotectOutsCopy(TestDvc):
         )
         self.assertEqual(ret, 0)
         self.assertTrue(os.access(self.FOO, os.W_OK))
-        with open(self.FOO) as fd:
+        with open(self.FOO, encoding="utf-8") as fd:
             self.assertEqual(fd.read(), "foo")
 
         ret = main(
@@ -365,13 +364,13 @@ class TestRunUnprotectOutsCopy(TestDvc):
         )
         self.assertEqual(ret, 0)
         self.assertTrue(os.access(self.FOO, os.W_OK))
-        with open(self.FOO) as fd:
+        with open(self.FOO, encoding="utf-8") as fd:
             self.assertEqual(fd.read(), "foo")
 
 
 class TestRunUnprotectOutsSymlink(TestDvc):
     def test(self):
-        with open(self.CODE, "w+") as fobj:
+        with open(self.CODE, "w+", encoding="utf-8") as fobj:
             fobj.write("import sys\n")
             fobj.write("import os\n")
             fobj.write("with open(sys.argv[1], 'a+') as fobj:\n")
@@ -403,7 +402,7 @@ class TestRunUnprotectOutsSymlink(TestDvc):
             self.assertFalse(os.access(self.FOO, os.W_OK))
 
         self.assertTrue(System.is_symlink(self.FOO))
-        with open(self.FOO) as fd:
+        with open(self.FOO, encoding="utf-8") as fd:
             self.assertEqual(fd.read(), "foo")
 
         ret = main(
@@ -430,13 +429,13 @@ class TestRunUnprotectOutsSymlink(TestDvc):
             self.assertFalse(os.access(self.FOO, os.W_OK))
 
         self.assertTrue(System.is_symlink(self.FOO))
-        with open(self.FOO) as fd:
+        with open(self.FOO, encoding="utf-8") as fd:
             self.assertEqual(fd.read(), "foo")
 
 
 class TestRunUnprotectOutsHardlink(TestDvc):
     def test(self):
-        with open(self.CODE, "w+") as fobj:
+        with open(self.CODE, "w+", encoding="utf-8") as fobj:
             fobj.write("import sys\n")
             fobj.write("import os\n")
             fobj.write("with open(sys.argv[1], 'a+') as fobj:\n")
@@ -462,7 +461,7 @@ class TestRunUnprotectOutsHardlink(TestDvc):
         self.assertEqual(ret, 0)
         self.assertFalse(os.access(self.FOO, os.W_OK))
         self.assertTrue(System.is_hardlink(self.FOO))
-        with open(self.FOO) as fd:
+        with open(self.FOO, encoding="utf-8") as fd:
             self.assertEqual(fd.read(), "foo")
 
         ret = main(
@@ -483,7 +482,7 @@ class TestRunUnprotectOutsHardlink(TestDvc):
         self.assertEqual(ret, 0)
         self.assertFalse(os.access(self.FOO, os.W_OK))
         self.assertTrue(System.is_hardlink(self.FOO))
-        with open(self.FOO) as fd:
+        with open(self.FOO, encoding="utf-8") as fd:
             self.assertEqual(fd.read(), "foo")
 
 
@@ -516,32 +515,6 @@ class TestCmdRunOverwrite(TestDvc):
         )
         self.assertEqual(ret, 0)
 
-        stage_mtime = os.path.getmtime("out.dvc")
-
-        time.sleep(1)
-
-        ret = main(
-            [
-                "run",
-                "-d",
-                self.FOO,
-                "-d",
-                self.CODE,
-                "-o",
-                "out",
-                "--file",
-                "out.dvc",
-                "--single-stage",
-                "python",
-                self.CODE,
-                self.FOO,
-                "out",
-            ]
-        )
-        self.assertEqual(ret, 0)
-
-        # NOTE: check that dvcfile was NOT overwritten
-        self.assertEqual(stage_mtime, os.path.getmtime("out.dvc"))
         stage_mtime = os.path.getmtime("out.dvc")
 
         time.sleep(1)
@@ -604,7 +577,7 @@ class TestCmdRunCliMetrics(TestDvc):
             ]
         )
         self.assertEqual(ret, 0)
-        with open("metrics.txt") as fd:
+        with open("metrics.txt", encoding="utf-8") as fd:
             self.assertEqual(fd.read().rstrip(), "test")
 
     def test_not_cached(self):
@@ -618,7 +591,7 @@ class TestCmdRunCliMetrics(TestDvc):
             ]
         )
         self.assertEqual(ret, 0)
-        with open("metrics.txt") as fd:
+        with open("metrics.txt", encoding="utf-8") as fd:
             self.assertEqual(fd.read().rstrip(), "test")
 
 
@@ -634,7 +607,7 @@ class TestCmdRunWorkingDirectory(TestDvc):
         self.assertNotIn(Stage.PARAM_WDIR, d.keys())
 
         stage = self.dvc.run(
-            cmd=f"echo test > {self.BAR}", outs=[self.BAR], single_stage=True,
+            cmd=f"echo test > {self.BAR}", outs=[self.BAR], single_stage=True
         )
         d = load_yaml(stage.relpath)
         self.assertNotIn(Stage.PARAM_WDIR, d.keys())
@@ -660,30 +633,40 @@ class TestCmdRunWorkingDirectory(TestDvc):
         self.assertEqual(d[Stage.PARAM_WDIR], "..")
 
 
-def test_rerun_deterministic(tmp_dir, run_copy):
+def test_rerun_deterministic(tmp_dir, run_copy, mocker):
+    from dvc.stage.run import subprocess
+
     tmp_dir.gen("foo", "foo content")
 
-    assert run_copy("foo", "out", single_stage=True) is not None
-    assert run_copy("foo", "out", single_stage=True) is None
+    spy = mocker.spy(subprocess, "Popen")
+
+    run_copy("foo", "out", single_stage=True)
+    assert spy.called
+
+    spy.reset_mock()
+    run_copy("foo", "out", single_stage=True)
+    assert not spy.called
 
 
-def test_rerun_deterministic_ignore_cache(tmp_dir, run_copy):
+def test_rerun_deterministic_ignore_cache(tmp_dir, run_copy, mocker):
+    from dvc.stage.run import subprocess
+
     tmp_dir.gen("foo", "foo content")
 
-    assert run_copy("foo", "out", single_stage=True) is not None
-    assert (
-        run_copy("foo", "out", run_cache=False, single_stage=True) is not None
-    )
+    spy = mocker.spy(subprocess, "Popen")
+
+    run_copy("foo", "out", single_stage=True)
+    assert spy.called
+
+    spy.reset_mock()
+    run_copy("foo", "out", run_cache=False, single_stage=True)
+    assert spy.called
 
 
 def test_rerun_callback(dvc):
     def run_callback(force=False):
         return dvc.run(
-            cmd="echo content > out",
-            outs=["out"],
-            deps=[],
-            force=force,
-            single_stage=True,
+            cmd="echo content > out", force=force, single_stage=True
         )
 
     assert run_callback() is not None
@@ -715,7 +698,7 @@ def test_rerun_changed_out(tmp_dir, run_copy):
     tmp_dir.gen("foo", "foo content")
     assert run_copy("foo", "out", single_stage=True) is not None
 
-    Path("out").write_text("modification")
+    Path("out").write_text("modification", encoding="utf-8")
     with pytest.raises(StageFileAlreadyExistsError):
         run_copy("foo", "out", force=False, single_stage=True)
 
@@ -738,12 +721,12 @@ class TestRunCommit(TestDvc):
         )
         self.assertEqual(ret, 0)
         self.assertTrue(os.path.isfile(fname))
-        self.assertFalse(os.path.exists(self.dvc.cache.local.cache_dir))
+        self.assertFalse(os.path.exists(self.dvc.odb.local.cache_dir))
 
         ret = main(["commit", fname + ".dvc"])
         self.assertEqual(ret, 0)
         self.assertTrue(os.path.isfile(fname))
-        self.assertEqual(len(os.listdir(self.dvc.cache.local.cache_dir)), 1)
+        self.assertEqual(len(os.listdir(self.dvc.odb.local.cache_dir)), 1)
 
 
 class TestRunPersist(TestDvc):
@@ -768,6 +751,7 @@ class TestRunPersist(TestDvc):
             [
                 "run",
                 "--single-stage",
+                "--always-changed",
                 self.outs_command,
                 file,
                 f"echo {file_content} >> {file}",
@@ -778,14 +762,14 @@ class TestRunPersist(TestDvc):
     def stage_should_contain_persist_flag(self, stage_file):
         stage_file_content = load_yaml(stage_file)
         self.assertEqual(
-            True, stage_file_content["outs"][0][BaseOutput.PARAM_PERSIST]
+            True, stage_file_content["outs"][0][Output.PARAM_PERSIST]
         )
 
     def should_append_upon_repro(self, file, stage_file):
         ret = main(["repro", stage_file])
         self.assertEqual(0, ret)
 
-        with open(file) as fobj:
+        with open(file, encoding="utf-8") as fobj:
             lines = fobj.readlines()
         self.assertEqual(2, len(lines))
 
@@ -830,21 +814,22 @@ class TestShouldRaiseOnOverlappingOutputPaths(TestDvc):
         data_dir_stage = self.DATA_DIR + DVC_FILE_SUFFIX
         data_stage = os.path.basename(self.DATA) + DVC_FILE_SUFFIX
 
-        self.assertIn("Paths for outs:\n", error_output)
+        self.assertIn("The output paths:\n", error_output)
         self.assertIn(
-            f"\n'{self.DATA_DIR}'('{data_dir_stage}')\n", error_output,
+            f"\n'{self.DATA_DIR}'('{data_dir_stage}')\n", error_output
         )
         self.assertIn(f"\n'{self.DATA}'('{data_stage}')\n", error_output)
         self.assertIn(
-            "\noverlap. To avoid unpredictable behaviour, rerun "
-            "command with non overlapping outs paths.",
+            "overlap and are thus in the same tracked directory.\n"
+            "To keep reproducibility, outputs should be in separate "
+            "tracked directories or tracked individually.",
             error_output,
         )
 
 
 class TestRerunWithSameOutputs(TestDvc):
     def _read_content_only(self, path):
-        with open(path) as fobj:
+        with open(path, encoding="utf-8") as fobj:
             return [line.rstrip() for line in fobj]
 
     @property
@@ -910,16 +895,21 @@ class TestShouldNotCheckoutUponCorruptedLocalHardlinkCache(TestDvc):
         super().setUp()
         ret = main(["config", "cache.type", "hardlink"])
         self.assertEqual(ret, 0)
+        self.dvc.close()
+
         self.dvc = DvcRepo(".")
 
     def test(self):
+        from tests.utils import clean_staging
+
         cmd = f"python {self.CODE} {self.FOO} {self.BAR}"
         stage = self.dvc.run(
             deps=[self.FOO], outs=[self.BAR], cmd=cmd, single_stage=True
         )
+        clean_staging()
 
         os.chmod(self.BAR, 0o644)
-        with open(self.BAR, "w") as fd:
+        with open(self.BAR, "w", encoding="utf-8") as fd:
             fd.write("corrupting the output cache")
 
         patch_checkout = mock.patch.object(
@@ -929,44 +919,13 @@ class TestShouldNotCheckoutUponCorruptedLocalHardlinkCache(TestDvc):
 
         patch_run = mock.patch("dvc.stage.run.cmd_run", wraps=cmd_run)
 
-        with self.dvc.lock, self.dvc.state:
+        with self.dvc.lock:
             with patch_checkout as mock_checkout:
                 with patch_run as mock_run:
                     stage.run()
 
                     mock_run.assert_called_once()
                     mock_checkout.assert_not_called()
-
-
-class TestPersistentOutput(TestDvc):
-    def test_ignore_run_cache(self):
-        warning = "Build cache is ignored when persisting outputs."
-
-        with open("immutable", "w") as fobj:
-            fobj.write("1")
-
-        cmd = [
-            "run",
-            "--force",
-            "--single-stage",
-            "--deps",
-            "immutable",
-            "--outs-persist",
-            "greetings",
-            "echo hello>>greetings",
-        ]
-
-        with self._caplog.at_level(logging.WARNING, logger="dvc"):
-            assert main(cmd) == 0
-            assert warning not in self._caplog.text
-
-            assert main(cmd) == 0
-            assert warning in self._caplog.text
-
-        # Even if the "immutable" dependency didn't change
-        # it should run the command again, as it is "ignoring build cache"
-        with open("greetings") as fobj:
-            assert "hello\nhello\n" == fobj.read()
 
 
 def test_bad_stage_fname(tmp_dir, dvc, run_copy):
@@ -992,9 +951,7 @@ def test_should_raise_on_stage_output(tmp_dir, dvc, run_copy):
         run_copy("foo", "name.dvc", single_stage=True)
 
 
-@pytest.mark.parametrize(
-    "metrics_type", ["metrics", "metrics_no_cache"],
-)
+@pytest.mark.parametrize("metrics_type", ["metrics", "metrics_no_cache"])
 def test_metrics_dir(tmp_dir, dvc, caplog, run_copy_metrics, metrics_type):
     copyargs = {metrics_type: ["dir_metric"]}
     tmp_dir.gen({"dir": {"file": "content"}})
@@ -1005,30 +962,70 @@ def test_metrics_dir(tmp_dir, dvc, caplog, run_copy_metrics, metrics_type):
     )
 
 
-def test_run_force_doesnot_preserve_comments_and_meta(tmp_dir, dvc, run_copy):
-    """Depends on loading of stage on `run` where we don't check the file
-    for stage already exists, so we don't copy `stage_text` over due to which
-    `meta` and `comments` don't get preserved."""
+def test_run_force_preserves_comments_and_meta(tmp_dir, dvc, run_copy):
     tmp_dir.gen({"foo": "foo", "foo1": "foo1"})
     text = textwrap.dedent(
         """\
+      desc: top desc
       cmd: python copy.py foo bar
       deps:
       - path: copy.py
       - path: foo
       outs:
-      # comment not preserved
+      # comment preserved
       - path: bar
+        desc: out desc
       meta:
         name: copy-foo-bar
     """
     )
     (tmp_dir / "bar.dvc").write_text(text)
     dvc.reproduce("bar.dvc")
-    assert "comment" in (tmp_dir / "bar.dvc").read_text()
-    assert "meta" in (tmp_dir / "bar.dvc").read_text()
+
+    # CRLF on windows makes the generated file bigger in size
+    code_size = 143 if os.name == "nt" else 142
+    assert (tmp_dir / "bar.dvc").read_text() == textwrap.dedent(
+        f"""\
+        desc: top desc
+        cmd: python copy.py foo bar
+        deps:
+        - path: copy.py
+          md5: 90c27dd80b698fe766f0c3ee0b6b9729
+          size: {code_size}
+        - path: foo
+          md5: acbd18db4cc2f85cedef654fccc4a4d8
+          size: 3
+        outs:
+        # comment preserved
+        - path: bar
+          desc: out desc
+          md5: acbd18db4cc2f85cedef654fccc4a4d8
+          size: 3
+        meta:
+          name: copy-foo-bar
+        md5: be659ce4a33cebb85d4e8e1335d394ad
+    """
+    )
 
     run_copy("foo1", "bar1", single_stage=True, force=True, fname="bar.dvc")
-
-    assert "comment" not in (tmp_dir / "bar.dvc").read_text()
-    assert "meta" not in (tmp_dir / "bar.dvc").read_text()
+    assert (tmp_dir / "bar.dvc").read_text() == textwrap.dedent(
+        f"""\
+        desc: top desc
+        cmd: python copy.py foo1 bar1
+        deps:
+        - path: foo1
+          md5: 299a0be4a5a79e6a59fdd251b19d78bb
+          size: 4
+        - path: copy.py
+          md5: 90c27dd80b698fe766f0c3ee0b6b9729
+          size: {code_size}
+        outs:
+        # comment preserved
+        - path: bar1
+          md5: 299a0be4a5a79e6a59fdd251b19d78bb
+          size: 4
+        meta:
+          name: copy-foo-bar
+        md5: 9e725b11cb393e6a7468369fa50328b7
+    """
+    )

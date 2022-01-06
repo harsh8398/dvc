@@ -3,41 +3,31 @@ import os
 import pytest
 from funcy import first
 
-from dvc.remote.index import RemoteIndex
+from dvc.objects.db.index import ObjectDBIndex
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture
 def index(dvc):
-    idx = RemoteIndex(dvc, "foo")
-    idx.load()
-    yield idx
-    idx.dump()
-    os.unlink(idx.path)
+    index_ = ObjectDBIndex(dvc.index_db_dir, "foo")
+    yield index_
 
 
 def test_init(dvc, index):
-    assert str(index.path) == os.path.join(dvc.tmp_dir, "index", "foo.idx")
-
-
-def test_is_dir_hash(dvc, index):
-    assert index.is_dir_hash("foo.dir")
-    assert not index.is_dir_hash("foo")
+    assert str(index.index_dir) == os.path.join(dvc.tmp_dir, "index", "foo")
 
 
 def test_roundtrip(dvc, index):
     expected_dir = {"1234.dir"}
     expected_file = {"5678"}
     index.update(expected_dir, expected_file)
-    index.dump()
-    index.load()
-    assert set(index.dir_hashes()) == expected_dir
-    assert set(index.hashes()) == expected_dir | expected_file
+
+    new_index = ObjectDBIndex(dvc.tmp_dir, "foo")
+    assert set(new_index.dir_hashes()) == expected_dir
+    assert set(new_index.hashes()) == expected_dir | expected_file
 
 
 def test_clear(dvc, index):
-    index.update(
-        ["1234.dir"], ["5678"],
-    )
+    index.update(["1234.dir"], ["5678"])
     index.clear()
     assert first(index.hashes()) is None
 

@@ -1,41 +1,44 @@
 import logging
 import os
+from typing import List
 
-from dvc.exceptions import NoMetricsError
-from dvc.path_info import PathInfo
+from dvc.fs.repo import RepoFileSystem
+from dvc.output import Output
 from dvc.repo import locked
-from dvc.tree.repo import RepoTree
-from dvc.utils.serialize import YAMLFileCorruptedError, load_yaml
+from dvc.repo.collect import StrPaths, collect
+from dvc.repo.live import summary_fs_path
+from dvc.scm import NoSCMError
+from dvc.utils import error_handler, errored_revisions, onerror_collect
+from dvc.utils.serialize import load_yaml
 
 logger = logging.getLogger(__name__)
 
 
-def _collect_metrics(repo, targets, recursive):
+def _is_metric(out: Output) -> bool:
+    return bool(out.metric) or bool(out.live)
 
-    if targets:
-        target_infos = [
-            PathInfo(os.path.abspath(target)) for target in targets
-        ]
-        tree = RepoTree(repo)
 
-        rec_files = []
-        if recursive:
-            for target_info in target_infos:
-                if tree.isdir(target_info):
-                    rec_files.extend(list(tree.walk_files(target_info)))
+def _to_fs_paths(metrics: List[Output]) -> StrPaths:
+    result = []
+    for out in metrics:
+        if out.metric:
+            result.append(out.fs_path)
+        elif out.live:
+            fs_path = summary_fs_path(out)
+            if fs_path:
+                result.append(fs_path)
+    return result
 
-        result = [t for t in target_infos if tree.isfile(t)]
-        result.extend(rec_files)
 
-        return result
-
-    metrics = set()
-    for stage in repo.stages:
-        for out in stage.outs:
-            if not out.metric:
-                continue
-            metrics.add(out.path_info)
-    return list(metrics)
+def _collect_metrics(repo, targets, revision, recursive):
+    metrics, fs_paths = collect(
+        repo,
+        targets=targets,
+        output_filter=_is_metric,
+        recursive=recursive,
+        rev=revision,
+    )
+    return _to_fs_paths(metrics) + list(fs_paths)
 
 
 def _extract_metrics(metrics, path, rev):
@@ -63,27 +66,31 @@ def _extract_metrics(metrics, path, rev):
     return ret
 
 
-def _read_metrics(repo, metrics, rev):
-    tree = RepoTree(repo)
+@error_handler
+def _read_metric(path, fs, rev, **kwargs):
+    val = load_yaml(path, fs=fs)
+    val = _extract_metrics(val, path, rev)
+    return val or {}
+
+
+def _read_metrics(repo, metrics, rev, onerror=None):
+    fs = RepoFileSystem(repo)
 
     res = {}
     for metric in metrics:
-        if not tree.exists(metric):
+        if not fs.isfile(metric):
             continue
 
-        try:
-            val = load_yaml(metric, tree=tree)
-        except (FileNotFoundError, YAMLFileCorruptedError):
-            logger.debug(
-                "failed to read '%s' on '%s'", metric, rev, exc_info=True
-            )
-            continue
-
-        val = _extract_metrics(val, metric, rev)
-        if val not in (None, {}):
-            res[str(metric)] = val
+        res[fs.path.relpath(metric, os.getcwd())] = _read_metric(
+            metric, fs, rev, onerror=onerror
+        )
 
     return res
+
+
+def _gather_metrics(repo, targets, rev, recursive, onerror=None):
+    metrics = _collect_metrics(repo, targets, rev, recursive)
+    return _read_metrics(repo, metrics, rev, onerror=onerror)
 
 
 @locked
@@ -95,46 +102,40 @@ def show(
     recursive=False,
     revs=None,
     all_commits=False,
+    onerror=None,
 ):
-    res = {}
-    metrics_found = False
+    if onerror is None:
+        onerror = onerror_collect
 
+    res = {}
     for rev in repo.brancher(
         revs=revs,
         all_branches=all_branches,
         all_tags=all_tags,
         all_commits=all_commits,
     ):
-        metrics = _collect_metrics(repo, targets, recursive)
-
-        if not metrics_found and metrics:
-            metrics_found = True
-
-        vals = _read_metrics(repo, metrics, rev)
-
-        if vals:
-            res[rev] = vals
-
-    if not res:
-        if metrics_found:
-            msg = (
-                "Could not parse metric files. Use `-v` option to see more "
-                "details."
-            )
-        else:
-            msg = (
-                "no metric files in this repository. Use `-m/-M` options for "
-                "`dvc run` to mark stage outputs as  metrics."
-            )
-        raise NoMetricsError(msg)
+        res[rev] = error_handler(_gather_metrics)(
+            repo, targets, rev, recursive, onerror=onerror
+        )
 
     # Hide workspace metrics if they are the same as in the active branch
     try:
         active_branch = repo.scm.active_branch()
-    except TypeError:
-        pass  # Detached head
+    except (TypeError, NoSCMError):
+        # TypeError - detached head
+        # NoSCMError - no repo case
+        pass
     else:
         if res.get("workspace") == res.get(active_branch):
             res.pop("workspace", None)
+
+    errored = errored_revisions(res)
+    if errored:
+        from dvc.ui import ui
+
+        ui.error_write(
+            "DVC failed to load some metrics for following revisions:"
+            f" '{', '.join(errored)}'."
+        )
 
     return res

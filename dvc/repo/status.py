@@ -29,7 +29,9 @@ def _joint_status(pairs):
 def _local_status(self, targets=None, with_deps=False, recursive=False):
     targets = targets or [None]
     pairs = cat(
-        self.collect_granular(t, with_deps=with_deps, recursive=recursive)
+        self.stage.collect_granular(
+            t, with_deps=with_deps, recursive=recursive
+        )
         for t in targets
     )
 
@@ -74,9 +76,7 @@ def _cloud_status(
 
             { "bar": "deleted" }
     """
-    import dvc.cache.base as cloud
-
-    used = self.used_cache(
+    used = self.used_objs(
         targets,
         all_branches=all_branches,
         all_tags=all_tags,
@@ -89,22 +89,16 @@ def _cloud_status(
     )
 
     ret = {}
-    status_info = self.cloud.status(
-        used, jobs, remote=remote, log_missing=False
-    )
-    for info in status_info.values():
-        name = info["name"]
-        status_ = info["status"]
-        if status_ == cloud.STATUS_OK:
+    for odb, obj_ids in used.items():
+        if odb is not None:
+            # ignore imported objects
             continue
-
-        prefix_map = {
-            cloud.STATUS_DELETED: "deleted",
-            cloud.STATUS_NEW: "new",
-            cloud.STATUS_MISSING: "missing",
-        }
-
-        ret[name] = prefix_map[status_]
+        status_info = self.cloud.status(
+            obj_ids, jobs, remote=remote, log_missing=False
+        )
+        for status_ in ("deleted", "new", "missing"):
+            for hash_info in getattr(status_info, status_, []):
+                ret[hash_info.obj_name] = status_
 
     return ret
 

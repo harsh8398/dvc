@@ -1,10 +1,12 @@
 from dvc import utils
+from dvc.fs.local import LocalFileSystem
 
 
 def test_file_md5_crlf(tmp_dir):
+    fs = LocalFileSystem()
     tmp_dir.gen("cr", b"a\nb\nc")
     tmp_dir.gen("crlf", b"a\r\nb\r\nc")
-    assert utils.file_md5("cr")[0] == utils.file_md5("crlf")[0]
+    assert utils.file_md5("cr", fs) == utils.file_md5("crlf", fs)
 
 
 def test_dict_md5():

@@ -1,24 +1,8 @@
 import json
 import logging
 import os
-import platform
-import sys
-import tempfile
-import uuid
 
-import distro
-import requests
-
-from dvc import __version__
-from dvc.config import Config, to_bool
-from dvc.daemon import daemon
-from dvc.exceptions import NotDvcRepoError
-from dvc.lock import Lock, LockError
-from dvc.repo import Repo
-from dvc.scm import SCM, NoSCM
-from dvc.scm.base import SCMError
-from dvc.utils import env2bool, is_binary
-from dvc.utils.fs import makedirs
+from .env import DVC_NO_ANALYTICS
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +19,10 @@ def collect_and_send_report(args=None, return_code=None):
     report as a JSON, where the _collector_ generates it and the _sender_
     removes it after sending it.
     """
+    import tempfile
+
+    from dvc.daemon import daemon
+
     report = {}
 
     # Include command execution information on the report only when available.
@@ -46,16 +34,22 @@ def collect_and_send_report(args=None, return_code=None):
 
     with tempfile.NamedTemporaryFile(delete=False, mode="w") as fobj:
         json.dump(report, fobj)
-        daemon(["analytics", fobj.name])
+    daemon(["analytics", fobj.name])
 
 
 def is_enabled():
+    from dvc.config import Config, to_bool
+    from dvc.utils import env2bool
+
     if env2bool("DVC_TEST"):
         return False
 
-    enabled = to_bool(
-        Config(validate=False).get("core", {}).get("analytics", "true")
-    )
+    enabled = not os.getenv(DVC_NO_ANALYTICS)
+    if enabled:
+        enabled = to_bool(
+            Config(validate=False).get("core", {}).get("analytics", "true")
+        )
+
     logger.debug("Analytics is {}abled.".format("en" if enabled else "dis"))
 
     return enabled
@@ -69,10 +63,12 @@ def send(path):
     `collect_and_send_report`. Sending happens on another process,
     thus, the need of removing such file afterwards.
     """
+    import requests
+
     url = "https://analytics.dvc.org"
     headers = {"content-type": "application/json"}
 
-    with open(path) as fobj:
+    with open(path, encoding="utf-8") as fobj:
         report = json.load(fobj)
 
     report.update(_runtime_info())
@@ -86,6 +82,13 @@ def send(path):
 
 
 def _scm_in_use():
+    from scmrepo.noscm import NoSCM
+
+    from dvc.exceptions import NotDvcRepoError
+    from dvc.repo import Repo
+
+    from .scm import SCM, SCMError
+
     try:
         scm = SCM(root_dir=Repo.find_root())
         return type(scm).__name__
@@ -99,6 +102,9 @@ def _runtime_info():
     """
     Gather information from the environment where DVC runs to fill a report.
     """
+    from dvc import __version__
+    from dvc.utils import is_binary
+
     return {
         "dvc_version": __version__,
         "is_binary": is_binary(),
@@ -109,6 +115,11 @@ def _runtime_info():
 
 
 def _system_info():
+    import platform
+    import sys
+
+    import distro
+
     system = platform.system()
 
     if system == "Windows":
@@ -147,6 +158,12 @@ def _find_or_create_user_id():
 
     IDs are generated randomly with UUID.
     """
+    import uuid
+
+    from dvc.config import Config
+    from dvc.lock import Lock, LockError
+    from dvc.utils.fs import makedirs
+
     config_dir = Config.get_dir("global")
     fname = os.path.join(config_dir, "user_id")
     lockfile = os.path.join(config_dir, "user_id.lock")
@@ -158,13 +175,13 @@ def _find_or_create_user_id():
     try:
         with Lock(lockfile):
             try:
-                with open(fname) as fobj:
+                with open(fname, encoding="utf-8") as fobj:
                     user_id = json.load(fobj)["user_id"]
 
             except (FileNotFoundError, ValueError, KeyError):
                 user_id = str(uuid.uuid4())
 
-                with open(fname, "w") as fobj:
+                with open(fname, "w", encoding="utf-8") as fobj:
                     json.dump({"user_id": user_id}, fobj)
 
             return user_id

@@ -1,8 +1,7 @@
 import logging
 
-from dvc.config import NoRemoteError
-from dvc.exceptions import DownloadError
-from dvc.scm.base import CloneError
+from dvc.exceptions import DownloadError, FileTransferError
+from dvc.scheme import Schemes
 
 from . import locked
 
@@ -16,12 +15,12 @@ def fetch(
     jobs=None,
     remote=None,
     all_branches=False,
-    show_checksums=False,
     with_deps=False,
     all_tags=False,
     recursive=False,
     all_commits=False,
     run_cache=False,
+    revs=None,
 ):
     """Download data items from a cloud and imported repositories
 
@@ -35,11 +34,10 @@ def fetch(
         config.NoRemoteError: thrown when downloading only local files and no
             remote is configured
     """
-
     if isinstance(targets, str):
         targets = [targets]
 
-    used = self.used_cache(
+    used = self.used_objs(
         targets,
         all_branches=all_branches,
         all_tags=all_tags,
@@ -49,6 +47,7 @@ def fetch(
         remote=remote,
         jobs=jobs,
         recursive=recursive,
+        revs=revs,
     )
 
     downloaded = 0
@@ -57,17 +56,21 @@ def fetch(
     try:
         if run_cache:
             self.stage_cache.pull(remote)
-        downloaded += self.cloud.pull(
-            used, jobs, remote=remote, show_checksums=show_checksums,
-        )
-    except NoRemoteError:
-        if not used.external and used["local"]:
-            raise
     except DownloadError as exc:
         failed += exc.amount
 
-    for (repo_url, repo_rev), files in used.external.items():
-        d, f = _fetch_external(self, repo_url, repo_rev, files, jobs)
+    for odb, obj_ids in sorted(
+        used.items(),
+        key=lambda item: item[0] is not None
+        and item[0].fs.scheme == Schemes.MEMORY,
+    ):
+        d, f = _fetch(
+            self,
+            obj_ids,
+            jobs=jobs,
+            remote=remote,
+            odb=odb,
+        )
         downloaded += d
         failed += f
 
@@ -77,22 +80,11 @@ def fetch(
     return downloaded
 
 
-def _fetch_external(self, repo_url, repo_rev, files, jobs):
-    from dvc.external_repo import external_repo
-
-    failed, downloaded = 0, 0
-    cache = self.cache.local
+def _fetch(repo, obj_ids, **kwargs):
+    downloaded = 0
+    failed = 0
     try:
-        with external_repo(
-            repo_url, repo_rev, cache_dir=cache.cache_dir
-        ) as repo:
-            d, f, _ = repo.fetch_external(files, jobs=jobs)
-            downloaded += d
-            failed += f
-    except CloneError:
-        failed += 1
-        logger.exception(
-            "failed to fetch data for '{}'".format(", ".join(files))
-        )
-
+        downloaded += repo.cloud.pull(obj_ids, **kwargs)
+    except FileTransferError as exc:
+        failed += exc.amount
     return downloaded, failed

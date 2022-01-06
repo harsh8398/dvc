@@ -3,9 +3,6 @@ from collections import OrderedDict
 from contextlib import contextmanager
 
 from funcy import reraise
-from ruamel.yaml import YAML
-from ruamel.yaml.constructor import DuplicateKeyError
-from ruamel.yaml.error import YAMLError as _YAMLError
 
 from ._common import ParseError, _dump_data, _load_data, _modify_data
 
@@ -19,20 +16,17 @@ class YAMLFileCorruptedError(YAMLError):
         super().__init__(path, "YAML file structure is corrupted")
 
 
-def load_yaml(path, tree=None):
-    return _load_data(path, parser=parse_yaml, tree=tree)
+def load_yaml(path, fs=None):
+    return _load_data(path, parser=parse_yaml, fs=fs)
 
 
 def parse_yaml(text, path, typ="safe"):
+    from ruamel.yaml import YAML
+    from ruamel.yaml import YAMLError as _YAMLError
+
     yaml = YAML(typ=typ)
-    try:
-        with reraise(_YAMLError, YAMLFileCorruptedError(path)):
-            return yaml.load(text) or {}
-    except DuplicateKeyError as exc:
-        # NOTE: unfortunately this one doesn't inherit from YAMLError, so we
-        # have to catch it by-hand. See
-        # https://yaml.readthedocs.io/en/latest/api.html#duplicate-keys
-        raise YAMLError(path, exc.problem)
+    with reraise(_YAMLError, YAMLFileCorruptedError(path)):
+        return yaml.load(text) or {}
 
 
 def parse_yaml_for_update(text, path):
@@ -48,6 +42,8 @@ def parse_yaml_for_update(text, path):
 
 
 def _get_yaml():
+    from ruamel.yaml import YAML
+
     yaml = YAML()
     yaml.default_flow_style = False
 
@@ -62,11 +58,13 @@ def _dump(data, stream):
     return yaml.dump(data, stream)
 
 
-def dump_yaml(path, data, tree=None):
-    return _dump_data(path, data, dumper=_dump, tree=tree)
+def dump_yaml(path, data, fs=None, **kwargs):
+    return _dump_data(path, data, dumper=_dump, fs=fs, **kwargs)
 
 
 def loads_yaml(s, typ="safe"):
+    from ruamel.yaml import YAML
+
     return YAML(typ=typ).load(s)
 
 
@@ -77,6 +75,6 @@ def dumps_yaml(d):
 
 
 @contextmanager
-def modify_yaml(path, tree=None):
-    with _modify_data(path, parse_yaml_for_update, dump_yaml, tree=tree) as d:
+def modify_yaml(path, fs=None):
+    with _modify_data(path, parse_yaml_for_update, dump_yaml, fs=fs) as d:
         yield d

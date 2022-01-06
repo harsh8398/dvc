@@ -25,7 +25,7 @@ def add_parser(subparsers, parent_parser):
     MOVE_HELP = "Rename or move a DVC controlled data file or a directory."
     MOVE_DESCRIPTION = (
         "Rename or move a DVC controlled data file or a directory.\n"
-        "It renames and modifies the corresponding DVC-file to reflect the"
+        "It renames and modifies the corresponding .dvc file to reflect the"
         " changes."
     )
 
@@ -37,9 +37,9 @@ def add_parser(subparsers, parent_parser):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     move_parser.add_argument(
-        "src", help="Source path to a data file or directory.",
+        "src", help="Source path to a data file or directory."
     ).complete = completion.FILE
     move_parser.add_argument(
-        "dst", help="Destination path.",
+        "dst", help="Destination path."
     ).complete = completion.FILE
     move_parser.set_defaults(func=CmdMove)

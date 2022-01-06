@@ -2,6 +2,7 @@ import logging
 
 from dvc.command.data_sync import CmdDataBase
 from dvc.exceptions import DvcException
+from dvc.ui import ui
 from dvc.utils import format_link
 
 logger = logging.getLogger(__name__)
@@ -11,6 +12,7 @@ class CmdDataStatus(CmdDataBase):
     STATUS_LEN = 20
     STATUS_INDENT = "\t"
     UP_TO_DATE_MSG = "Data and pipelines are up to date."
+    IN_SYNC_MSG = "Cache and remote '{remote}' are in sync."
     EMPTY_PROJECT_MSG = (
         "There are no data or pipelines tracked in this project yet.\n"
         "See {link} to get started!"
@@ -25,7 +27,7 @@ class CmdDataStatus(CmdDataBase):
         ind = indent * self.STATUS_INDENT
 
         if isinstance(status, str):
-            logger.info(f"{ind}{status}")
+            ui.write(f"{ind}{status}")
             return
 
         if isinstance(status, list):
@@ -37,41 +39,53 @@ class CmdDataStatus(CmdDataBase):
 
         for key, value in status.items():
             if isinstance(value, str):
-                logger.info("{}{}{}".format(ind, self._normalize(value), key))
+                ui.write(f"{ind}{self._normalize(value)}{key}")
             elif value:
-                logger.info(f"{ind}{key}:")
+                ui.write(f"{ind}{key}:")
                 self._show(value, indent + 1)
 
     def run(self):
+        from dvc.repo import lock_repo
+
         indent = 1 if self.args.cloud else 0
-        try:
-            st = self.repo.status(
-                targets=self.args.targets,
-                jobs=self.args.jobs,
-                cloud=self.args.cloud,
-                remote=self.args.remote,
-                all_branches=self.args.all_branches,
-                all_tags=self.args.all_tags,
-                all_commits=self.args.all_commits,
-                with_deps=self.args.with_deps,
-                recursive=self.args.recursive,
-            )
+
+        with lock_repo(self.repo):
+            try:
+                st = self.repo.status(
+                    targets=self.args.targets,
+                    jobs=self.args.jobs,
+                    cloud=self.args.cloud,
+                    remote=self.args.remote,
+                    all_branches=self.args.all_branches,
+                    all_tags=self.args.all_tags,
+                    all_commits=self.args.all_commits,
+                    with_deps=self.args.with_deps,
+                    recursive=self.args.recursive,
+                )
+            except DvcException:
+                logger.exception("")
+                return 1
 
             if self.args.quiet:
                 return bool(st)
 
-            if self.args.show_json:
-                import json
+            if self.args.json:
+                ui.write_json(st)
+                return 0
 
-                logger.info(json.dumps(st))
-            elif st:
+            if st:
                 self._show(st, indent)
-            elif not self.repo.stages:
-                logger.info(self.EMPTY_PROJECT_MSG)
-            else:
-                logger.info(self.UP_TO_DATE_MSG)
+                return 0
 
-        except DvcException:
-            logger.exception("")
-            return 1
+            # additional hints for the user
+            if not self.repo.index.stages:
+                ui.write(self.EMPTY_PROJECT_MSG)
+            elif self.args.cloud or self.args.remote:
+                remote = self.args.remote or self.repo.config["core"].get(
+                    "remote"
+                )
+                ui.write(self.IN_SYNC_MSG.format(remote=remote))
+            else:
+                ui.write(self.UP_TO_DATE_MSG)
+
         return 0

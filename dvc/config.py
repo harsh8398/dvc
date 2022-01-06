@@ -4,25 +4,10 @@ import os
 import re
 from contextlib import contextmanager
 from functools import partial
-from urllib.parse import urlparse
 
-import configobj
-from funcy import cached_property, compact, re_find, walk_values
-from voluptuous import (
-    ALLOW_EXTRA,
-    All,
-    Any,
-    Coerce,
-    Invalid,
-    Lower,
-    Optional,
-    Range,
-    Schema,
-)
+from funcy import cached_property, compact, memoize, re_find
 
 from dvc.exceptions import DvcException, NotDvcRepoError
-from dvc.path_info import PathInfo
-from dvc.utils import relpath
 
 logger = logging.getLogger(__name__)
 
@@ -34,198 +19,43 @@ class ConfigError(DvcException):
         super().__init__(f"config file error: {msg}")
 
 
-class NoRemoteError(ConfigError):
+class RemoteConfigError(ConfigError):
     pass
 
 
-def supported_cache_type(types):
-    """Checks if link type config option consists only of valid values.
-
-    Args:
-        types (list/string): type(s) of links that dvc should try out.
-    """
-    if types is None:
-        return None
-    if isinstance(types, str):
-        types = [typ.strip() for typ in types.split(",")]
-
-    unsupported = set(types) - {"reflink", "hardlink", "symlink", "copy"}
-    if unsupported:
-        raise Invalid(
-            "Unsupported cache type(s): {}".format(", ".join(unsupported))
-        )
-
-    return types
-
-
-# Checks that value is either true or false and converts it to bool
-to_bool = Bool = All(
-    Lower,
-    Any("true", "false"),
-    lambda v: v == "true",
-    msg="expected true or false",
-)
-
-
-def Choices(*choices):
-    """Checks that value belongs to the specified set of values
-
-    Args:
-        *choices: pass allowed values as arguments, or pass a list or
-            tuple as a single argument
-    """
-    return Any(*choices, msg="expected one of {}".format(", ".join(choices)))
-
-
-def ByUrl(mapping):
-    schemas = walk_values(Schema, mapping)
-
-    def validate(data):
-        if "url" not in data:
-            raise Invalid("expected 'url'")
-
-        parsed = urlparse(data["url"])
-        # Windows absolute paths should really have scheme == "" (local)
-        if os.name == "nt" and len(parsed.scheme) == 1 and parsed.netloc == "":
-            return schemas[""](data)
-        if parsed.scheme not in schemas:
-            raise Invalid(f"Unsupported URL type {parsed.scheme}://")
-
-        return schemas[parsed.scheme](data)
-
-    return validate
-
-
-class RelPath(str):
+class NoRemoteError(RemoteConfigError):
     pass
 
 
-REMOTE_COMMON = {
-    "url": str,
-    "checksum_jobs": All(Coerce(int), Range(1)),
-    Optional("no_traverse"): Bool,  # obsoleted
-    "verify": Bool,
-}
-LOCAL_COMMON = {
-    "type": supported_cache_type,
-    Optional("protected", default=False): Bool,  # obsoleted
-    "shared": All(Lower, Choices("group")),
-    Optional("slow_link_warning", default=True): Bool,
-}
-HTTP_COMMON = {
-    "auth": All(Lower, Choices("basic", "digest", "custom")),
-    "custom_auth_header": str,
-    "user": str,
-    "password": str,
-    "ask_password": Bool,
-    "ssl_verify": Bool,
-    "method": str,
-}
-WEBDAV_COMMON = {
-    "user": str,
-    "password": str,
-    "ask_password": Bool,
-    "token": str,
-    "cert_path": str,
-    "key_path": str,
-    "timeout": Coerce(int),
-}
+class RemoteNotFoundError(RemoteConfigError):
+    pass
 
-SCHEMA = {
-    "core": {
-        "remote": Lower,
-        "checksum_jobs": All(Coerce(int), Range(1)),
-        Optional("interactive", default=False): Bool,
-        Optional("analytics", default=True): Bool,
-        Optional("hardlink_lock", default=False): Bool,
-        Optional("no_scm", default=False): Bool,
-        Optional("autostage", default=False): Bool,
-        Optional("experiments", default=False): Bool,
-        Optional("check_update", default=True): Bool,
-    },
-    "cache": {
-        "local": str,
-        "s3": str,
-        "gs": str,
-        "hdfs": str,
-        "ssh": str,
-        "azure": str,
-        # This is for default local cache
-        "dir": str,
-        **LOCAL_COMMON,
-    },
-    "remote": {
-        str: ByUrl(
-            {
-                "": {**LOCAL_COMMON, **REMOTE_COMMON},
-                "s3": {
-                    "region": str,
-                    "profile": str,
-                    "credentialpath": str,
-                    "endpointurl": str,
-                    "access_key_id": str,
-                    "secret_access_key": str,
-                    Optional("listobjects", default=False): Bool,  # obsoleted
-                    Optional("use_ssl", default=True): Bool,
-                    "sse": str,
-                    "sse_kms_key_id": str,
-                    "acl": str,
-                    "grant_read": str,
-                    "grant_read_acp": str,
-                    "grant_write_acp": str,
-                    "grant_full_control": str,
-                    **REMOTE_COMMON,
-                },
-                "gs": {
-                    "projectname": str,
-                    "credentialpath": str,
-                    **REMOTE_COMMON,
-                },
-                "ssh": {
-                    "type": supported_cache_type,
-                    "port": Coerce(int),
-                    "user": str,
-                    "password": str,
-                    "ask_password": Bool,
-                    "keyfile": str,
-                    "timeout": Coerce(int),
-                    "gss_auth": Bool,
-                    "allow_agent": Bool,
-                    **REMOTE_COMMON,
-                },
-                "hdfs": {"user": str, **REMOTE_COMMON},
-                "azure": {"connection_string": str, **REMOTE_COMMON},
-                "oss": {
-                    "oss_key_id": str,
-                    "oss_key_secret": str,
-                    "oss_endpoint": str,
-                    **REMOTE_COMMON,
-                },
-                "gdrive": {
-                    "gdrive_use_service_account": Bool,
-                    "gdrive_client_id": str,
-                    "gdrive_client_secret": str,
-                    "gdrive_user_credentials_file": str,
-                    "gdrive_service_account_email": str,
-                    "gdrive_service_account_user_email": str,
-                    "gdrive_service_account_p12_file_path": str,
-                    Optional("gdrive_trash_only", default=False): Bool,
-                    **REMOTE_COMMON,
-                },
-                "http": {**HTTP_COMMON, **REMOTE_COMMON},
-                "https": {**HTTP_COMMON, **REMOTE_COMMON},
-                "webdav": {**WEBDAV_COMMON, **REMOTE_COMMON},
-                "webdavs": {**WEBDAV_COMMON, **REMOTE_COMMON},
-                "remote": {str: object},  # Any of the above options are valid
-            }
-        )
-    },
-    "state": {
-        "row_limit": All(Coerce(int), Range(1)),
-        "row_cleanup_quota": All(Coerce(int), Range(0, 100)),
-    },
-}
-COMPILED_SCHEMA = Schema(SCHEMA)
+
+class MachineConfigError(ConfigError):
+    pass
+
+
+class NoMachineError(MachineConfigError):
+    pass
+
+
+class MachineNotFoundError(MachineConfigError):
+    pass
+
+
+@memoize
+def get_compiled_schema():
+    from voluptuous import Schema
+
+    from .config_schema import SCHEMA
+
+    return Schema(SCHEMA)
+
+
+def to_bool(value):
+    from .config_schema import Bool
+
+    return Bool(value)
 
 
 class Config(dict):
@@ -245,16 +75,18 @@ class Config(dict):
     APPNAME = "dvc"
     APPAUTHOR = "iterative"
 
+    SYSTEM_LEVELS = ("system", "global")
+    REPO_LEVELS = ("repo", "local")
     # In the order they shadow each other
-    LEVELS = ("system", "global", "repo", "local")
+    LEVELS = SYSTEM_LEVELS + REPO_LEVELS
 
     CONFIG = "config"
     CONFIG_LOCAL = "config.local"
 
     def __init__(
-        self, dvc_dir=None, validate=True, tree=None,
+        self, dvc_dir=None, validate=True, fs=None, config=None
     ):  # pylint: disable=super-init-not-called
-        from dvc.tree.local import LocalTree
+        from dvc.fs.local import LocalFileSystem
 
         self.dvc_dir = dvc_dir
 
@@ -262,16 +94,16 @@ class Config(dict):
             try:
                 from dvc.repo import Repo
 
-                self.dvc_dir = os.path.join(Repo.find_dvc_dir())
+                self.dvc_dir = Repo.find_dvc_dir()
             except NotDvcRepoError:
                 self.dvc_dir = None
         else:
             self.dvc_dir = os.path.abspath(os.path.realpath(dvc_dir))
 
-        self.wtree = LocalTree(None, {"url": self.dvc_dir})
-        self.tree = tree or self.wtree
+        self.wfs = LocalFileSystem(url=self.dvc_dir)
+        self.fs = fs or self.wfs
 
-        self.load(validate=validate)
+        self.load(validate=validate, config=config)
 
     @classmethod
     def get_dir(cls, level):
@@ -308,16 +140,19 @@ class Config(dict):
             dvc.config.Config: config object.
         """
         config_file = os.path.join(dvc_dir, Config.CONFIG)
-        open(config_file, "w+").close()
+        open(config_file, "w+", encoding="utf-8").close()
         return Config(dvc_dir)
 
-    def load(self, validate=True):
+    def load(self, validate=True, config=None):
         """Loads config from all the config files.
 
         Raises:
             ConfigError: thrown if config has an invalid format.
         """
         conf = self.load_config_to_level()
+
+        if config is not None:
+            merge(conf, config)
 
         if validate:
             conf = self.validate(conf)
@@ -329,32 +164,36 @@ class Config(dict):
         if not self["cache"].get("dir") and self.dvc_dir:
             self["cache"]["dir"] = os.path.join(self.dvc_dir, "cache")
 
-    def _get_tree(self, level):
-        # NOTE: this might be a GitTree, which doesn't see things outside of
+    def _get_fs(self, level):
+        # NOTE: this might be a Gitfs, which doesn't see things outside of
         # the repo.
-        return self.tree if level == "repo" else self.wtree
+        return self.fs if level == "repo" else self.wfs
 
     def _load_config(self, level):
-        filename = self.files[level]
-        tree = self._get_tree(level)
+        from configobj import ConfigObj
 
-        if tree.exists(filename, use_dvcignore=False):
-            with tree.open(filename) as fobj:
-                conf_obj = configobj.ConfigObj(fobj)
+        filename = self.files[level]
+        fs = self._get_fs(level)
+
+        if fs.exists(filename):
+            with fs.open(filename) as fobj:
+                conf_obj = ConfigObj(fobj)
         else:
-            conf_obj = configobj.ConfigObj()
-        return _parse_remotes(_lower_keys(conf_obj.dict()))
+            conf_obj = ConfigObj()
+        return _parse_named(_lower_keys(conf_obj.dict()))
 
     def _save_config(self, level, conf_dict):
+        from configobj import ConfigObj
+
         filename = self.files[level]
-        tree = self._get_tree(level)
+        fs = self._get_fs(level)
 
         logger.debug(f"Writing '{filename}'.")
 
-        tree.makedirs(os.path.dirname(filename))
+        fs.makedirs(os.path.dirname(filename))
 
-        config = configobj.ConfigObj(_pack_remotes(conf_dict))
-        with tree.open(filename, "wb") as fobj:
+        config = ConfigObj(_pack_named(conf_dict))
+        with fs.open(filename, "wb") as fobj:
             config.write(fobj)
         config.filename = filename
 
@@ -363,7 +202,7 @@ class Config(dict):
         conf = self._load_paths(conf, self.files[level])
 
         # Auto-verify sections
-        for key in COMPILED_SCHEMA.schema:
+        for key in get_compiled_schema().schema:
             conf.setdefault(key, {})
 
         return conf
@@ -373,21 +212,35 @@ class Config(dict):
         abs_conf_dir = os.path.abspath(os.path.dirname(filename))
 
         def resolve(path):
+            from .config_schema import RelPath
+
             if os.path.isabs(path) or re.match(r"\w+://", path):
                 return path
+
+            # on windows convert slashes to backslashes
+            # to have path compatible with abs_conf_dir
+            if os.path.sep == "\\" and "/" in path:
+                path = path.replace("/", "\\")
+
             return RelPath(os.path.join(abs_conf_dir, path))
 
         return Config._map_dirs(conf, resolve)
 
     @staticmethod
     def _to_relpath(conf_dir, path):
+        from dvc.fs.local import localfs
+        from dvc.utils import relpath
+
+        from .config_schema import RelPath
+
         if re.match(r"\w+://", path):
             return path
 
         if isinstance(path, RelPath) or not os.path.isabs(path):
             path = relpath(path, conf_dir)
+            return localfs.path.as_posix(path)
 
-        return PathInfo(path).as_posix()
+        return path
 
     @staticmethod
     def _save_paths(conf, filename):
@@ -398,11 +251,22 @@ class Config(dict):
 
     @staticmethod
     def _map_dirs(conf, func):
+        from voluptuous import ALLOW_EXTRA, Schema
+
         dirs_schema = {
             "cache": {"dir": func},
             "remote": {
-                str: {"url": func, "gdrive_user_credentials_file": func}
+                str: {
+                    "url": func,
+                    "gdrive_user_credentials_file": func,
+                    "gdrive_service_account_json_file_path": func,
+                    "credentialpath": func,
+                    "keyfile": func,
+                    "cert_path": func,
+                    "key_path": func,
+                }
             },
+            "machine": {str: {"startup_script": func}},
         }
         return Schema(dirs_schema, extra=ALLOW_EXTRA)(conf)
 
@@ -415,9 +279,17 @@ class Config(dict):
                 merge(merged_conf, self.load_one(merge_level))
         return merged_conf
 
+    def read(self, level=None):
+        # NOTE: we read from a merged config by default, same as git config
+        if level is None:
+            return self.load_config_to_level()
+        return self.load_one(level)
+
     @contextmanager
-    def edit(self, level="repo"):
-        if level in {"repo", "local"} and self.dvc_dir is None:
+    def edit(self, level=None, validate=True):
+        # NOTE: we write to repo config by default, same as git config
+        level = level or "repo"
+        if self.dvc_dir is None and level in self.REPO_LEVELS:
             raise ConfigError("Not inside a DVC repo")
 
         conf = self.load_one(level)
@@ -427,40 +299,46 @@ class Config(dict):
 
         merged_conf = self.load_config_to_level(level)
         merge(merged_conf, conf)
-        self.validate(merged_conf)
+
+        if validate:
+            self.validate(merged_conf)
 
         self._save_config(level, conf)
-        self.load()
+        self.load(validate=validate)
 
     @staticmethod
     def validate(data):
+        from voluptuous import Invalid
+
         try:
-            return COMPILED_SCHEMA(data)
+            return get_compiled_schema()(data)
         except Invalid as exc:
             raise ConfigError(str(exc)) from None
 
 
-def _parse_remotes(conf):
-    result = {"remote": {}}
+def _parse_named(conf):
+    result = {"remote": {}, "machine": {}}
 
     for section, val in conf.items():
-        name = re_find(r'^\s*remote\s*"(.*)"\s*$', section)
-        if name:
-            result["remote"][name] = val
+        match = re_find(r'^\s*(remote|machine)\s*"(.*)"\s*$', section)
+        if match:
+            key, name = match
+            result[key][name] = val
         else:
             result[section] = val
 
     return result
 
 
-def _pack_remotes(conf):
+def _pack_named(conf):
     # Drop empty sections
     result = compact(conf)
 
     # Transform remote.name -> 'remote "name"'
-    for name, val in conf["remote"].items():
-        result[f'remote "{name}"'] = val
-    result.pop("remote", None)
+    for key in ("remote", "machine"):
+        for name, val in conf[key].items():
+            result[f'{key} "{name}"'] = val
+        result.pop(key, None)
 
     return result
 

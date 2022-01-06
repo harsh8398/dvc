@@ -1,17 +1,14 @@
 import argparse
-import logging
 
 from dvc.command import completion
 from dvc.command.base import CmdBase, append_doc_link
-from dvc.exceptions import DvcException
-
-logger = logging.getLogger(__name__)
+from dvc.ui import ui
 
 
 class CmdCheckIgnore(CmdBase):
     def __init__(self, args):
         super().__init__(args)
-        self.ignore_filter = self.repo.tree.dvcignore
+        self.ignore_filter = self.repo.dvcignore
 
     def _show_results(self, result):
         if not result.match and not self.args.non_matching:
@@ -23,9 +20,9 @@ class CmdCheckIgnore(CmdBase):
                 patterns = patterns[-1:]
 
             for pattern in patterns:
-                logger.info("{}\t{}".format(pattern, result.file))
+                ui.write(pattern, result.file, sep="\t")
         else:
-            logger.info(result.file)
+            ui.write(result.file)
 
     def _check_one_file(self, target):
         result = self.ignore_filter.check_ignore(target)
@@ -55,6 +52,8 @@ class CmdCheckIgnore(CmdBase):
         return ret
 
     def _check_args(self):
+        from dvc.exceptions import DvcException
+
         if not self.args.stdin and not self.args.targets:
             raise DvcException("`targets` or `--stdin` needed")
 
@@ -121,6 +120,6 @@ def add_parser(subparsers, parent_parser):
         help="Read paths from standard input instead of providing `targets`.",
     )
     parser.add_argument(
-        "targets", nargs="*", help="File or directory paths to check",
+        "targets", nargs="*", help="File or directory paths to check"
     ).complete = completion.FILE
     parser.set_defaults(func=CmdCheckIgnore)

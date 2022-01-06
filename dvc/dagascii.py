@@ -3,50 +3,12 @@
 import logging
 import math
 import os
-import pydoc
-import sys
 
 from grandalf.graphs import Edge, Graph, Vertex
 from grandalf.layouts import SugiyamaLayout
 from grandalf.routing import EdgeViewer, route_with_lines
 
-from dvc.env import DVC_PAGER
-from dvc.utils import format_link
-
 logger = logging.getLogger(__name__)
-
-
-DEFAULT_PAGER = "less"
-DEFAULT_PAGER_FORMATTED = "{} --chop-long-lines --clear-screen".format(
-    DEFAULT_PAGER
-)
-
-
-def make_pager(cmd):
-    def pager(text):
-        return pydoc.tempfilepager(pydoc.plain(text), cmd)
-
-    return pager
-
-
-def find_pager():
-    if not sys.stdout.isatty():
-        return pydoc.plainpager
-
-    env_pager = os.getenv(DVC_PAGER)
-    if env_pager:
-        return make_pager(env_pager)
-
-    if os.system(f"({DEFAULT_PAGER}) 2>{os.devnull}") == 0:
-        return make_pager(DEFAULT_PAGER_FORMATTED)
-
-    logger.warning(
-        "Unable to find `less` in the PATH. Check out "
-        "{} for more info.".format(
-            format_link("https://man.dvc.org/pipeline/show")
-        )
-    )
-    return pydoc.plainpager
 
 
 class VertexViewer:
@@ -201,7 +163,7 @@ class AsciiCanvas:
         self.point(x0 + width, y0 + height, "+")
 
 
-def _build_sugiyama_layout(vertexes, edges):
+def _build_sugiyama_layout(vertices, edges):
     #
     # Just a reminder about naming conventions:
     # +------------X
@@ -212,17 +174,17 @@ def _build_sugiyama_layout(vertexes, edges):
     # Y
     #
 
-    vertexes = {v: Vertex(f" {v} ") for v in vertexes}
+    vertices = {v: Vertex(f" {v} ") for v in vertices}
     # NOTE: reverting edges to correctly orientate the graph
-    edges = [Edge(vertexes[e], vertexes[s]) for s, e in edges]
-    vertexes = vertexes.values()
-    graph = Graph(vertexes, edges)
+    edges = [Edge(vertices[e], vertices[s]) for s, e in edges]
+    vertices = vertices.values()
+    graph = Graph(vertices, edges)
 
-    for vertex in vertexes:
+    for vertex in vertices:
         vertex.view = VertexViewer(vertex.data)
 
     # NOTE: determine min box length to create the best layout
-    minw = min(v.view.w for v in vertexes)
+    minw = min(v.view.w for v in vertices)
 
     for edge in edges:
         edge.view = EdgeViewer()
@@ -242,11 +204,11 @@ def _build_sugiyama_layout(vertexes, edges):
     return sug
 
 
-def draw(vertexes, edges):
+def draw(vertices, edges):
     """Build a DAG and draw it in ASCII.
 
     Args:
-        vertexes (list): list of graph vertexes.
+        vertices (list): list of graph vertices.
         edges (list): list of graph edges.
     """
     # pylint: disable=too-many-locals
@@ -255,7 +217,7 @@ def draw(vertexes, edges):
     Xs = []  # pylint: disable=invalid-name
     Ys = []  # pylint: disable=invalid-name
 
-    sug = _build_sugiyama_layout(vertexes, edges)
+    sug = _build_sugiyama_layout(vertices, edges)
 
     for vertex in sug.g.sV:
         # NOTE: moving boxes w/2 to the left

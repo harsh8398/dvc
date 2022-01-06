@@ -10,17 +10,16 @@ from dvc.cli import parse_args
 
 
 @pytest.fixture
-def tmp_global_dir(tmp_path):
+def tmp_global_dir(mocker, tmp_path):
     """
     Fixture to prevent modifying the actual global config
     """
-    with mock.patch("dvc.config.Config.get_dir", return_value=str(tmp_path)):
-        yield
+    mocker.patch("dvc.config.Config.get_dir", return_value=str(tmp_path))
 
 
-@mock.patch("dvc.daemon._spawn")
-@mock.patch("json.dump")
-def test_collect_and_send_report(mock_json, mock_daemon, tmp_global_dir):
+def test_collect_and_send_report(mocker, tmp_global_dir):
+    mock_json = mocker.patch("json.dump")
+    mock_daemon = mocker.patch("dvc.daemon._spawn")
     analytics.collect_and_send_report()
     report = mock_json.call_args[0][0]
 
@@ -67,7 +66,7 @@ def test_send(mock_post, tmp_path):
 
     analytics.send(str(report_file))
     assert mock_post.called
-    assert mock_post.call_args.args[0] == url
+    assert mock_post.call_args[0][0] == url
     assert not report_file.exists()
 
 
@@ -82,14 +81,48 @@ def test_send(mock_post, tmp_path):
     ],
 )
 def test_is_enabled(dvc, config, result, monkeypatch, tmp_global_dir):
-    import configobj
-
-    conf = configobj.ConfigObj({"core": config})
-    conf.filename = dvc.config.files["repo"]
-    conf.write()
+    with dvc.config.edit(validate=False) as conf:
+        conf["core"] = config
 
     # reset DVC_TEST env var, which affects `is_enabled()`
     monkeypatch.delenv("DVC_TEST")
+    monkeypatch.delenv("DVC_NO_ANALYTICS", raising=False)
+
+    assert result == analytics.is_enabled()
+
+
+@pytest.mark.parametrize(
+    "config, env, result",
+    [
+        (None, None, True),
+        (None, "true", False),
+        (None, "false", False),  # only checking if env is set
+        ("false", None, False),
+        ("false", "true", False),
+        ("false", "false", False),
+        ("true", None, True),
+        ("true", "true", False),
+        ("true", "false", False),  # we checking if env is set
+    ],
+)
+def test_is_enabled_env_neg(
+    dvc, config, env, result, monkeypatch, tmp_global_dir
+):
+    # reset DVC_TEST env var, which affects `is_enabled()`
+    monkeypatch.delenv("DVC_TEST")
+    monkeypatch.delenv("DVC_NO_ANALYTICS", raising=False)
+
+    with dvc.config.edit() as conf:
+        conf["core"] = {}
+
+    assert analytics.is_enabled()
+
+    if config is not None:
+        with dvc.config.edit() as conf:
+            conf["core"] = {"analytics": config}
+
+    if env is not None:
+        monkeypatch.setenv("DVC_NO_ANALYTICS", env)
 
     assert result == analytics.is_enabled()
 

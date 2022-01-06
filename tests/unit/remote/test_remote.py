@@ -1,8 +1,11 @@
+import os
+
 import pytest
 
-from dvc.tree import get_cloud_tree
-from dvc.tree.gs import GSTree
-from dvc.tree.s3 import S3Tree
+from dvc.fs import get_cloud_fs
+from dvc.fs.gs import GSFileSystem
+from dvc.fs.s3 import S3FileSystem
+from dvc.objects.db import get_index
 
 
 def test_remote_with_hash_jobs(dvc):
@@ -12,32 +15,59 @@ def test_remote_with_hash_jobs(dvc):
     }
     dvc.config["core"]["checksum_jobs"] = 200
 
-    tree = get_cloud_tree(dvc, name="with_hash_jobs")
-    assert tree.hash_jobs == 100
+    cls, config, _ = get_cloud_fs(dvc, name="with_hash_jobs")
+    fs = cls(**config)
+    assert fs.hash_jobs == 100
+
+
+def test_remote_with_jobs(dvc):
+    dvc.config["remote"]["with_jobs"] = {
+        "url": "s3://bucket/name",
+        "jobs": 100,
+    }
+    dvc.config["core"]["jobs"] = 200
+
+    cls, config, _ = get_cloud_fs(dvc, name="with_jobs")
+    fs = cls(**config)
+    assert fs.jobs == 100
 
 
 def test_remote_without_hash_jobs(dvc):
     dvc.config["remote"]["without_hash_jobs"] = {"url": "s3://bucket/name"}
     dvc.config["core"]["checksum_jobs"] = 200
 
-    tree = get_cloud_tree(dvc, name="without_hash_jobs")
-    assert tree.hash_jobs == 200
+    cls, config, _ = get_cloud_fs(dvc, name="without_hash_jobs")
+    fs = cls(**config)
+    assert fs.hash_jobs == 200
 
 
 def test_remote_without_hash_jobs_default(dvc):
     dvc.config["remote"]["without_hash_jobs"] = {"url": "s3://bucket/name"}
 
-    tree = get_cloud_tree(dvc, name="without_hash_jobs")
-    assert tree.hash_jobs == tree.HASH_JOBS
+    cls, config, _ = get_cloud_fs(dvc, name="without_hash_jobs")
+    fs = cls(**config)
+    assert fs.hash_jobs == fs.HASH_JOBS
 
 
-@pytest.mark.parametrize("tree_cls", [GSTree, S3Tree])
-def test_makedirs_not_create_for_top_level_path(tree_cls, dvc, mocker):
-    url = f"{tree_cls.scheme}://bucket/"
-    tree = tree_cls(dvc, {"url": url})
+@pytest.mark.parametrize("fs_cls", [GSFileSystem, S3FileSystem])
+def test_makedirs_not_create_for_top_level_path(fs_cls, dvc, mocker):
+    url = f"{fs_cls.scheme}://bucket/"
+    fs = fs_cls(url=url)
     mocked_client = mocker.PropertyMock()
-    # we use remote clients with same name as scheme to interact with remote
-    mocker.patch.object(tree_cls, tree.scheme, mocked_client)
+    mocker.patch.object(fs_cls, "fs", mocked_client)
 
-    tree.makedirs(tree.path_info)
+    fs.makedirs(url)
     assert not mocked_client.called
+
+
+def test_remote_index_dir_config(make_tmp_dir, dvc):
+    index_dir = str(make_tmp_dir("tmp_index"))
+    with dvc.config.edit() as conf:
+        conf["index"]["dir"] = index_dir
+        conf["remote"]["s3"] = {"url": "s3://bucket/name"}
+
+    dvc.root_dir = "/usr/local/test_repo"
+
+    assert os.path.dirname(
+        get_index(dvc.cloud.get_remote_odb(name="s3")).index_dir
+    ) == os.path.join(index_dir, ".dvc", "test_repo-a473718", "index")

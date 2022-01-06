@@ -1,47 +1,46 @@
 import argparse
+import json
 import logging
-import os
+
+from funcy import first
 
 from dvc.command import completion
 from dvc.command.base import CmdBase, append_doc_link, fix_subparsers
 from dvc.exceptions import DvcException
-from dvc.schema import PLOT_PROPS
+from dvc.render.utils import match_renderers, render
+from dvc.render.vega import VegaRenderer
+from dvc.ui import ui
 from dvc.utils import format_link
 
 logger = logging.getLogger(__name__)
 
-PAGE_HTML = """<!DOCTYPE html>
-<html>
-<head>
-    <title>DVC Plot</title>
-    <script src="https://cdn.jsdelivr.net/npm/vega@5.10.0"></script>
-    <script src="https://cdn.jsdelivr.net/npm/vega-lite@4.8.1"></script>
-    <script src="https://cdn.jsdelivr.net/npm/vega-embed@6.5.1"></script>
-</head>
-<body>
-    {divs}
-</body>
-</html>"""
 
-DIV_HTML = """<div id = "{id}"></div>
-<script type = "text/javascript">
-    var spec = {vega_json};
-    vegaEmbed('#{id}', spec);
-</script>"""
+def _show_json(renderers, path: None):
+    if any(lambda r: r.needs_output_path for r in renderers) and not path:
+        raise DvcException("Output path ('-o') is required!")
+
+    result = {
+        renderer.filename: json.loads(renderer.as_json(path=path))
+        for renderer in renderers
+    }
+    if result:
+        ui.write_json(result)
 
 
 class CmdPlots(CmdBase):
-    UNINITIALIZED = True
-
     def _func(self, *args, **kwargs):
         raise NotImplementedError
 
     def _props(self):
+        from dvc.schema import PLOT_PROPS
+
         # Pass only props specified by user, to not shadow ones from plot def
         props = {p: getattr(self.args, p) for p in PLOT_PROPS}
         return {k: v for k, v in props.items() if v is not None}
 
     def run(self):
+        from pathlib import Path
+
         if self.args.show_vega:
             if not self.args.targets:
                 logger.error("please specify a target for `--show-vega`")
@@ -51,42 +50,77 @@ class CmdPlots(CmdBase):
                     "you can only specify one target for `--show-vega`"
                 )
                 return 1
+            if self.args.json:
+                logger.error(
+                    "'--show-vega' and '--json' are mutually exclusive "
+                    "options."
+                )
+                return 1
 
         try:
-            plots = self._func(targets=self.args.targets, props=self._props())
+
+            plots_data = self._func(
+                targets=self.args.targets, props=self._props()
+            )
+
+            if not plots_data:
+                ui.error_write(
+                    "No plots were loaded, "
+                    "visualization file will not be created."
+                )
+
+            renderers = match_renderers(
+                plots_data=plots_data, templates=self.repo.plots.templates
+            )
 
             if self.args.show_vega:
-                target = self.args.targets[0]
-                logger.info(plots[target])
+                renderer = first(
+                    filter(lambda r: isinstance(r, VegaRenderer), renderers)
+                )
+                if renderer:
+                    ui.write_json(renderer.asdict())
+                return 0
+            if self.args.json:
+                _show_json(renderers, self.args.out)
                 return 0
 
-            divs = [
-                DIV_HTML.format(id=f"plot{i}", vega_json=plot)
-                for i, plot in enumerate(plots.values())
-            ]
-            html = PAGE_HTML.format(divs="\n".join(divs))
-            path = self.args.out or "plots.html"
-
-            with open(path, "w") as fobj:
-                fobj.write(html)
-
-            logger.info(
-                "file://{}".format(os.path.join(self.repo.root_dir, path))
+            rel: str = self.args.out or "dvc_plots"
+            path: Path = (Path.cwd() / rel).resolve()
+            index_path = render(
+                self.repo,
+                renderers,
+                path=path,
+                html_template_path=self.args.html_template,
             )
+
+            ui.write(index_path.as_uri())
+            auto_open = self.repo.config["plots"].get("auto_open", False)
+            if self.args.open or auto_open:
+                if not auto_open:
+                    ui.write(
+                        "To enable auto opening, you can run:\n"
+                        "\n"
+                        "\tdvc config plots.auto_open true"
+                    )
+                return ui.open_browser(index_path)
+
+            return 0
 
         except DvcException:
             logger.exception("")
             return 1
 
-        return 0
-
 
 class CmdPlotsShow(CmdPlots):
+    UNINITIALIZED = True
+
     def _func(self, *args, **kwargs):
         return self.repo.plots.show(*args, **kwargs)
 
 
 class CmdPlotsDiff(CmdPlots):
+    UNINITIALIZED = True
+
     def _func(self, *args, **kwargs):
         return self.repo.plots.diff(
             *args,
@@ -99,7 +133,7 @@ class CmdPlotsDiff(CmdPlots):
 class CmdPlotsModify(CmdPlots):
     def run(self):
         self.repo.plots.modify(
-            self.args.target, props=self._props(), unset=self.args.unset,
+            self.args.target, props=self._props(), unset=self.args.unset
         )
         return 0
 
@@ -107,7 +141,7 @@ class CmdPlotsModify(CmdPlots):
 def add_parser(subparsers, parent_parser):
     PLOTS_HELP = (
         "Commands to visualize and compare plot metrics in structured files "
-        "(JSON, YAML, CSV, TSV)"
+        "(JSON, YAML, CSV, TSV)."
     )
 
     plots_parser = subparsers.add_parser(
@@ -124,7 +158,7 @@ def add_parser(subparsers, parent_parser):
 
     fix_subparsers(plots_subparsers)
 
-    SHOW_HELP = "Generate plots from metric files."
+    SHOW_HELP = "Generate plots from metrics files."
     plots_show_parser = plots_subparsers.add_parser(
         "show",
         parents=[parent_parser],
@@ -157,10 +191,12 @@ def add_parser(subparsers, parent_parser):
     plots_diff_parser.add_argument(
         "--targets",
         nargs="*",
-        help="Files to visualize (supports any file, "
-        "even when not found as `plots` in `dvc.yaml`). "
-        "Shows all plots by default.",
-        metavar="<path>",
+        help=(
+            "Specific plots file(s) to visualize "
+            "(even if not found as `plots` in `dvc.yaml`). "
+            "Shows all tracked plots by default."
+        ),
+        metavar="<paths>",
     ).complete = completion.FILE
     plots_diff_parser.add_argument(
         "-e",
@@ -170,13 +206,16 @@ def add_parser(subparsers, parent_parser):
         help=argparse.SUPPRESS,
     )
     plots_diff_parser.add_argument(
-        "revisions", nargs="*", default=None, help="Git commits to plot from",
+        "revisions", nargs="*", default=None, help="Git commits to plot from"
     )
     _add_props_arguments(plots_diff_parser)
     _add_output_arguments(plots_diff_parser)
     plots_diff_parser.set_defaults(func=CmdPlotsDiff)
 
-    PLOTS_MODIFY_HELP = "Modify display properties of plot metric files."
+    PLOTS_MODIFY_HELP = (
+        "Modify display properties of data-series plots "
+        "(has no effect on image-type plots)."
+    )
     plots_modify_parser = plots_subparsers.add_parser(
         "modify",
         parents=[parent_parser],
@@ -185,7 +224,7 @@ def add_parser(subparsers, parent_parser):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     plots_modify_parser.add_argument(
-        "target", help="Metric file to set properties to",
+        "target", help="Metric file to set properties to"
     ).complete = completion.FILE
     _add_props_arguments(plots_modify_parser)
     plots_modify_parser.add_argument(
@@ -248,4 +287,23 @@ def _add_output_arguments(parser):
         action="store_true",
         default=False,
         help="Show output in Vega format.",
+    )
+    parser.add_argument(
+        "--json",
+        "--show-json",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--open",
+        action="store_true",
+        default=False,
+        help="Open plot file directly in the browser.",
+    )
+    parser.add_argument(
+        "--html-template",
+        default=None,
+        help="Custom HTML template for VEGA visualization.",
+        metavar="<path>",
     )

@@ -46,8 +46,7 @@ def test_save(tmp_dir, dvc, run_copy):
     tmp_dir.gen("foo", "foo")
     stage = run_copy("foo", "bar", name="copy-foo-bar")
     assert _recurse_count_files(run_cache_dir) == 1
-    with dvc.state:
-        assert dvc.stage_cache._load(stage)
+    assert dvc.stage_cache._load(stage)
 
 
 def test_do_not_save_on_no_exec_and_dry(tmp_dir, dvc, run_copy):
@@ -58,14 +57,12 @@ def test_do_not_save_on_no_exec_and_dry(tmp_dir, dvc, run_copy):
     stage = run_copy("foo", "bar", name="copy-foo-bar", no_exec=True)
 
     assert _recurse_count_files(run_cache_dir) == 0
-    with dvc.state:
-        assert not dvc.stage_cache._load(stage)
+    assert not dvc.stage_cache._load(stage)
 
     (stage,) = dvc.reproduce("copy-foo-bar", dry=True)
 
     assert _recurse_count_files(run_cache_dir) == 0
-    with dvc.state:
-        assert not dvc.stage_cache._load(stage)
+    assert not dvc.stage_cache._load(stage)
 
 
 def test_uncached_outs_are_cached(tmp_dir, dvc, run_copy):
@@ -76,8 +73,7 @@ def test_uncached_outs_are_cached(tmp_dir, dvc, run_copy):
         outs_no_cache=["bar"],
         name="copy-foo-bar",
     )
-    with dvc.state:
-        stage.outs[0].hash_info = stage.outs[0].get_hash()
+    stage.outs[0].hash_info = stage.outs[0].get_hash()
     assert os.path.exists(relpath(stage.outs[0].cache_path))
 
 
@@ -154,6 +150,8 @@ def test_memory_runs_of_multiple_stages(tmp_dir, dvc, run_copy, mocker):
 
 
 def test_restore_pull(tmp_dir, dvc, run_copy, mocker, local_remote):
+    import dvc.output as dvc_output
+
     tmp_dir.gen("foo", "foo")
     stage = run_copy("foo", "bar", name="copy-foo-bar")
 
@@ -161,7 +159,7 @@ def test_restore_pull(tmp_dir, dvc, run_copy, mocker, local_remote):
 
     mock_restore = mocker.spy(dvc.stage_cache, "restore")
     mock_run = mocker.patch("dvc.stage.run.cmd_run")
-    mock_checkout = mocker.spy(dvc.cache.local, "checkout")
+    mock_checkout = mocker.spy(dvc_output, "checkout")
 
     # removing any information that `dvc` could use to re-generate from
     (tmp_dir / "bar").unlink()
@@ -172,6 +170,6 @@ def test_restore_pull(tmp_dir, dvc, run_copy, mocker, local_remote):
 
     mock_restore.assert_called_once_with(stage, pull=True)
     mock_run.assert_not_called()
-    mock_checkout.assert_called_once()
+    assert mock_checkout.call_count == 2
     assert (tmp_dir / "bar").exists() and not (tmp_dir / "foo").unlink()
     assert (tmp_dir / PIPELINE_LOCK).exists()

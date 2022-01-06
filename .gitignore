@@ -5,6 +5,7 @@ neatlynx/__pycache__
 *.pyc
 .env/
 .env2.7/
+.python-version
 
 .dvc.conf.lock
 .DS_Store
@@ -12,6 +13,7 @@ build/
 dist/
 
 *.egg-info/
+.eggs
 
 hooks/*.pyc
 
@@ -37,3 +39,4 @@ scripts/ci/gcp-creds.json
 .gcp-creds.json
 
 *~
+/dvc/_dvc_version.py

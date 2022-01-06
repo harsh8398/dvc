@@ -1,18 +1,18 @@
 import os
+from unittest.mock import ANY, patch
 
-from mock import ANY, patch
+from scmrepo.git import Git
 
 from dvc.external_repo import CLONES, external_repo
-from dvc.hash_info import HashInfo
-from dvc.path_info import PathInfo
-from dvc.scm.git import Git
-from dvc.tree.local import LocalTree
+from dvc.objects.stage import stage
+from dvc.objects.transfer import transfer
 from dvc.utils import relpath
 from dvc.utils.fs import makedirs, remove
-from tests.unit.tree.test_repo import make_subrepo
+from tests.unit.fs.test_repo import make_subrepo
+from tests.utils import clean_staging
 
 
-def test_external_repo(erepo_dir):
+def test_external_repo(erepo_dir, mocker):
     with erepo_dir.chdir():
         with erepo_dir.branch("branch", new=True):
             erepo_dir.dvc_gen("file", "branch", commit="create file on branch")
@@ -20,16 +20,17 @@ def test_external_repo(erepo_dir):
 
     url = os.fspath(erepo_dir)
 
-    with patch.object(Git, "clone", wraps=Git.clone) as mock:
-        with external_repo(url) as repo:
-            with repo.open_by_relpath("file") as fd:
-                assert fd.read() == "master"
+    mock = mocker.patch.object(Git, "clone", wraps=Git.clone)
 
-        with external_repo(url, rev="branch") as repo:
-            with repo.open_by_relpath("file") as fd:
-                assert fd.read() == "branch"
+    with external_repo(url) as repo:
+        with repo.open_by_relpath("file") as fd:
+            assert fd.read() == "master"
 
-        assert mock.call_count == 1
+    with external_repo(url, rev="branch") as repo:
+        with repo.open_by_relpath("file") as fd:
+            assert fd.read() == "branch"
+
+    assert mock.call_count == 1
 
 
 def test_source_change(erepo_dir):
@@ -46,12 +47,14 @@ def test_source_change(erepo_dir):
 
 
 def test_cache_reused(erepo_dir, mocker, local_cloud):
+    import dvc.fs.utils
+
     erepo_dir.add_remote(config=local_cloud.config)
     with erepo_dir.chdir():
         erepo_dir.dvc_gen("file", "text", commit="add file")
     erepo_dir.dvc.push()
 
-    download_spy = mocker.spy(LocalTree, "download")
+    download_spy = mocker.spy(dvc.fs.utils, "transfer")
 
     # Use URL to prevent any fishy optimizations
     url = f"file://{erepo_dir}"
@@ -92,10 +95,10 @@ def test_pull_subdir_file(tmp_dir, erepo_dir):
 
     dest = tmp_dir / "file"
     with external_repo(os.fspath(erepo_dir)) as repo:
-        _, _, save_infos = repo.fetch_external(
-            [os.path.join("subdir", "file")]
+        repo.repo_fs.download(
+            os.path.join(repo.root_dir, "subdir", "file"),
+            os.fspath(dest),
         )
-        repo.cache.local.checkout(PathInfo(dest), save_infos[0])
 
     assert dest.is_file()
     assert dest.read_text() == "contents"
@@ -114,7 +117,7 @@ def test_relative_remote(erepo_dir, tmp_dir):
     erepo_dir.dvc.push()
 
     (erepo_dir / "file").unlink()
-    remove(erepo_dir.dvc.cache.local.cache_dir)
+    remove(erepo_dir.dvc.odb.local.cache_dir)
 
     url = os.fspath(erepo_dir)
 
@@ -138,7 +141,9 @@ def test_shallow_clone_branch(erepo_dir):
             with repo.open_by_relpath("file") as fd:
                 assert fd.read() == "branch"
 
-        mock_clone.assert_called_with(url, ANY, shallow_branch="branch")
+        mock_clone.assert_called_with(
+            url, ANY, shallow_branch="branch", progress=ANY
+        )
         _, shallow = CLONES[url]
         assert shallow
 
@@ -164,7 +169,9 @@ def test_shallow_clone_tag(erepo_dir):
             with repo.open_by_relpath("file") as fd:
                 assert fd.read() == "foo"
 
-        mock_clone.assert_called_with(url, ANY, shallow_branch="v1")
+        mock_clone.assert_called_with(
+            url, ANY, shallow_branch="v1", progress=ANY
+        )
         _, shallow = CLONES[url]
         assert shallow
 
@@ -188,26 +195,39 @@ def test_subrepos_are_ignored(tmp_dir, erepo_dir):
         subrepo.dvc_gen({"file": "file"}, commit="add files on subrepo")
 
     with external_repo(os.fspath(erepo_dir)) as repo:
-        repo.get_external("dir", "out")
+        repo.repo_fs.download(
+            os.path.join(repo.root_dir, "dir"),
+            os.fspath(tmp_dir / "out"),
+        )
         expected_files = {"foo": "foo", "bar": "bar", ".gitignore": "/foo\n"}
         assert (tmp_dir / "out").read_text() == expected_files
 
-        expected_hash = HashInfo("md5", "e1d9e8eae5374860ae025ec84cfd85c7.dir")
-        assert (
-            repo.get_checksum(os.path.join(repo.root_dir, "dir"))
-            == expected_hash
-        )
-
-        # clear cache to test `fetch_external` again
-        cache_dir = tmp_dir / repo.cache.local.cache_dir
+        # clear cache to test saving to cache
+        cache_dir = tmp_dir / repo.odb.local.cache_dir
         remove(cache_dir)
+        clean_staging()
         makedirs(cache_dir)
 
-        assert repo.fetch_external(["dir"]) == (
-            len(expected_files),
-            0,
-            [expected_hash],
+        staging, _, obj = stage(
+            repo.odb.local,
+            os.path.join(repo.root_dir, "dir"),
+            repo.repo_fs,
+            "md5",
+            dvcignore=repo.dvcignore,
         )
+        transfer(
+            staging,
+            repo.odb.local,
+            {obj.hash_info},
+            shallow=False,
+            hardlink=True,
+        )
+        assert set(cache_dir.glob("??/*")) == {
+            cache_dir / "e1" / "d9e8eae5374860ae025ec84cfd85c7.dir",
+            cache_dir / "37" / "b51d194a7513e45b56f6524f2d51f2",
+            cache_dir / "94" / "7d2b84e5aa88170e80dff467a5bfb6",
+            cache_dir / "ac" / "bd18db4cc2f85cedef654fccc4a4d8",
+        }
 
 
 def test_subrepos_are_ignored_for_git_tracked_dirs(tmp_dir, erepo_dir):
@@ -221,6 +241,9 @@ def test_subrepos_are_ignored_for_git_tracked_dirs(tmp_dir, erepo_dir):
         subrepo.dvc_gen({"file": "file"}, commit="add files on subrepo")
 
     with external_repo(os.fspath(erepo_dir)) as repo:
-        repo.get_external("dir", "out")
+        repo.repo_fs.download(
+            os.path.join(repo.root_dir, "dir"),
+            os.fspath(tmp_dir / "out"),
+        )
         # subrepo files should not be here
         assert (tmp_dir / "out").read_text() == scm_files

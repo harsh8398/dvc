@@ -1,44 +1,35 @@
 import argparse
-import logging
 import operator
-
-import colorama
 
 from dvc.command import completion
 from dvc.command.base import CmdBase, append_doc_link
 from dvc.exceptions import CheckoutError
-from dvc.utils.humanize import get_summary
-
-logger = logging.getLogger(__name__)
+from dvc.ui import ui
 
 
 def log_changes(stats):
-    colors = [
-        ("modified", colorama.Fore.YELLOW,),
-        ("added", colorama.Fore.GREEN),
-        ("deleted", colorama.Fore.RED,),
-    ]
+    colors = {
+        "modified": "yellow",
+        "added": "green",
+        "deleted": "red",
+    }
 
-    for state, color in colors:
+    for state, color in colors.items():
         entries = stats.get(state)
 
         if not entries:
             continue
 
         for entry in entries:
-            logger.info(
-                "{color}{state}{nc}{spacing}{entry}".format(
-                    color=color,
-                    state=state[0].upper(),
-                    nc=colorama.Fore.RESET,
-                    spacing="\t",
-                    entry=entry,
-                )
+            ui.write(
+                f"[{color}]{state[0].upper()}", entry, styled=True, sep="\t"
             )
 
 
 class CmdCheckout(CmdBase):
     def run(self):
+        from dvc.utils.humanize import get_summary
+
         stats, exc = None, None
         try:
             stats = self.repo.checkout(
@@ -57,7 +48,7 @@ class CmdCheckout(CmdBase):
             msg = get_summary(
                 sorted(stats.items(), key=operator.itemgetter(0))
             )
-            logger.info(msg or default_message)
+            ui.write(msg or default_message)
         else:
             log_changes(stats)
 

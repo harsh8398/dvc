@@ -4,19 +4,19 @@ import tempfile
 import pytest
 
 from dvc.dvcfile import SingleStageFile
+from dvc.fs.local import LocalFileSystem
 from dvc.main import main
-from dvc.output.local import LocalOutput
-from dvc.repo import Repo
+from dvc.output import Output
+from dvc.repo import Repo, lock_repo
 from dvc.stage import PipelineStage, Stage
-from dvc.stage.exceptions import StageFileFormatError
 from dvc.stage.run import run_stage
-from dvc.tree.local import LocalTree
 from dvc.utils.serialize import dump_yaml, load_yaml
+from dvc.utils.strictyaml import YAMLValidationError
 from tests.basic_env import TestDvc
 
 
 def test_cmd_obj():
-    with pytest.raises(StageFileFormatError):
+    with pytest.raises(YAMLValidationError):
         SingleStageFile.validate({Stage.PARAM_CMD: {}})
 
 
@@ -33,10 +33,10 @@ def test_cmd_str():
 
 
 def test_object():
-    with pytest.raises(StageFileFormatError):
+    with pytest.raises(YAMLValidationError):
         SingleStageFile.validate({Stage.PARAM_DEPS: {}})
 
-    with pytest.raises(StageFileFormatError):
+    with pytest.raises(YAMLValidationError):
         SingleStageFile.validate({Stage.PARAM_OUTS: {}})
 
 
@@ -55,15 +55,15 @@ def test_empty_list():
 
 def test_list():
     lst = [
-        {LocalOutput.PARAM_PATH: "foo", LocalTree.PARAM_CHECKSUM: "123"},
-        {LocalOutput.PARAM_PATH: "bar", LocalTree.PARAM_CHECKSUM: None},
-        {LocalOutput.PARAM_PATH: "baz"},
+        {Output.PARAM_PATH: "foo", LocalFileSystem.PARAM_CHECKSUM: "123"},
+        {Output.PARAM_PATH: "bar", LocalFileSystem.PARAM_CHECKSUM: None},
+        {Output.PARAM_PATH: "baz"},
     ]
     d = {Stage.PARAM_DEPS: lst}
     SingleStageFile.validate(d)
 
-    lst[0][LocalOutput.PARAM_CACHE] = True
-    lst[1][LocalOutput.PARAM_CACHE] = False
+    lst[0][Output.PARAM_CACHE] = True
+    lst[1][Output.PARAM_CACHE] = False
     d = {Stage.PARAM_OUTS: lst}
     SingleStageFile.validate(d)
 
@@ -107,7 +107,7 @@ class TestDefaultWorkingDirectory(TestDvc):
         d = load_yaml(stage.relpath)
         self.assertNotIn(Stage.PARAM_WDIR, d.keys())
 
-        with self.dvc.lock, self.dvc.state:
+        with self.dvc.lock:
             stage = SingleStageFile(self.dvc, stage.relpath).stage
             self.assertFalse(stage.changed())
 
@@ -144,7 +144,7 @@ class TestExternalRemoteResolution(TestDvc):
 
         os.makedirs(storage)
 
-        with open(file_path, "w") as fobj:
+        with open(file_path, "w", encoding="utf-8") as fobj:
             fobj.write("Isle of Dogs")
 
         assert main(["remote", "add", "tmp", tmp_path]) == 0
@@ -157,7 +157,7 @@ class TestExternalRemoteResolution(TestDvc):
 def test_md5_ignores_comments(tmp_dir, dvc):
     (stage,) = tmp_dir.dvc_gen("foo", "foo content")
 
-    with open(stage.path, "a") as f:
+    with open(stage.path, "a", encoding="utf-8") as f:
         f.write("# End comment\n")
 
     new_stage = SingleStageFile(dvc, stage.path).stage
@@ -168,17 +168,36 @@ def test_meta_is_preserved(tmp_dir, dvc):
     (stage,) = tmp_dir.dvc_gen("foo", "foo content")
 
     # Add meta to DVC-file
-    data = load_yaml(stage.path)
+    data = (tmp_dir / stage.path).parse()
     data["meta"] = {"custom_key": 42}
-    dump_yaml(stage.path, data)
+    (tmp_dir / stage.path).dump(data)
 
     # Loading and dumping to test that it works and meta is retained
     dvcfile = SingleStageFile(dvc, stage.path)
     new_stage = dvcfile.stage
     dvcfile.dump(new_stage)
 
-    new_data = load_yaml(stage.path)
+    new_data = (tmp_dir / stage.path).parse()
     assert new_data["meta"] == data["meta"]
+
+
+def test_desc_is_preserved(tmp_dir, dvc):
+    (stage,) = tmp_dir.dvc_gen("foo", "foo content")
+
+    data = (tmp_dir / stage.path).parse()
+    stage_desc = "test stage description"
+    out_desc = "test out description"
+    data["desc"] = stage_desc
+    data["outs"][0]["desc"] = out_desc
+    (tmp_dir / stage.path).dump(data)
+
+    dvcfile = SingleStageFile(dvc, stage.path)
+    new_stage = dvcfile.stage
+    dvcfile.dump(new_stage)
+
+    new_data = (tmp_dir / stage.path).parse()
+    assert new_data["desc"] == stage_desc
+    assert new_data["outs"][0]["desc"] == out_desc
 
 
 def test_parent_repo_collect_stages(tmp_dir, scm, dvc):
@@ -197,13 +216,22 @@ def test_parent_repo_collect_stages(tmp_dir, scm, dvc):
         deep_subrepo_dir.gen("subrepo_file", "subrepo file content")
         deep_subrepo.add("subrepo_file")
 
-    stages = dvc.collect(None)
-    subrepo_stages = subrepo.collect(None)
-    deep_subrepo_stages = deep_subrepo.collect(None)
+    dvc._reset()
+
+    stages = dvc.stage.collect(None)
+    subrepo_stages = subrepo.stage.collect(None)
+    deep_subrepo_stages = deep_subrepo.stage.collect(None)
 
     assert stages == []
     assert subrepo_stages != []
     assert deep_subrepo_stages != []
+
+
+def test_collect_repo_ignored_dir_unignored_pattern(tmp_dir, dvc, scm):
+    tmp_dir.gen({".gitignore": "data/**\n!data/**/\n!data/**/*.dvc"})
+    scm.add([".gitignore"])
+    (stage,) = tmp_dir.dvc_gen({"data/raw/tracked.csv": "5,6,7,8"})
+    assert dvc.stage.collect_repo() == [stage]
 
 
 def test_stage_strings_representation(tmp_dir, dvc, run_copy):
@@ -287,5 +315,9 @@ def test_stage_run_checkpoint(tmp_dir, dvc, mocker, checkpoint):
         callback = mocker.Mock()
     else:
         callback = None
-    run_stage(stage, checkpoint_func=callback)
-    mock_cmd_run.assert_called_with(stage, checkpoint=checkpoint)
+
+    with lock_repo(dvc):
+        run_stage(stage, checkpoint_func=callback)
+    mock_cmd_run.assert_called_with(
+        stage, checkpoint_func=callback, dry=False, run_env=None
+    )

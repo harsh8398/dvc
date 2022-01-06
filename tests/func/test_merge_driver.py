@@ -33,12 +33,12 @@ def _gen(tmp_dir, struct, name):
                 "subdir": {"foo": "foo", "bar": "bar", "baz": "baz"},
             },
         ),
-        ({}, {"foo": "foo"}, {"bar": "bar"}, {"foo": "foo", "bar": "bar"},),
-        ({}, {}, {"bar": "bar"}, {"bar": "bar"},),
-        ({}, {"foo": "foo"}, {}, {"foo": "foo"},),
-        (None, {"foo": "foo"}, {"bar": "bar"}, {"foo": "foo", "bar": "bar"},),
-        (None, None, {"bar": "bar"}, {"bar": "bar"},),
-        (None, {"foo": "foo"}, None, {"foo": "foo"},),
+        ({}, {"foo": "foo"}, {"bar": "bar"}, {"foo": "foo", "bar": "bar"}),
+        ({}, {}, {"bar": "bar"}, {"bar": "bar"}),
+        ({}, {"foo": "foo"}, {}, {"foo": "foo"}),
+        (None, {"foo": "foo"}, {"bar": "bar"}, {"foo": "foo", "bar": "bar"}),
+        (None, None, {"bar": "bar"}, {"bar": "bar"}),
+        (None, {"foo": "foo"}, None, {"foo": "foo"}),
     ],
 )
 def test_merge(tmp_dir, dvc, ancestor, our, their, merged):
@@ -111,40 +111,6 @@ def test_merge_conflict(tmp_dir, dvc, ancestor, our, their, error, caplog):
         != 0
     )
 
-    assert error in caplog.text
-
-
-@pytest.mark.parametrize(
-    "workspace", [pytest.lazy_fixture("ssh")], indirect=True
-)
-def test_merge_different_output_types(tmp_dir, dvc, caplog, workspace):
-    (tmp_dir / "ancestor").touch()
-
-    (tmp_dir / "our").write_text(
-        "outs:\n- md5: f123456789.dir\n  path: ssh://example.com/path\n"
-    )
-
-    (tmp_dir / "their").write_text(
-        "outs:\n- md5: f987654321.dir\n  path: path\n"
-    )
-
-    assert (
-        main(
-            [
-                "git-hook",
-                "merge-driver",
-                "--ancestor",
-                "ancestor",
-                "--our",
-                "our",
-                "--their",
-                "their",
-            ]
-        )
-        != 0
-    )
-
-    error = "unable to auto-merge outputs of different types"
     assert error in caplog.text
 
 
@@ -237,5 +203,5 @@ def test_merge_non_dvc_add(tmp_dir, dvc, caplog):
         != 0
     )
 
-    error = "unable to auto-merge DVC-files that weren't created by `dvc add`"
+    error = "unable to auto-merge DVC files that weren't created by `dvc add`"
     assert error in caplog.text

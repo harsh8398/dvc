@@ -1,19 +1,13 @@
 ---
 version: '3.2'
 services:
-  azurite:
-    image: mcr.microsoft.com/azure-storage/azurite:3.3.0-preview
+  git-server:
+    image: ghcr.io/linuxserver/openssh-server
+    environment:
+      - USER_NAME=user
+      - PUBLIC_KEY_FILE=/tmp/key
     ports:
-      - "10000"
-  oss:
-    image: rkuprieiev/oss-emulator
-    ports:
-      - "8880"
-  hdfs:
-    image: rkuprieiev/docker-hdfs
-    ports:
-      - "8020"
-      # NOTE: having this port as dynamic one will require modifying
-      # `dfs.datanode.address` in `hdfs-site.xml` and probably something
-      # else, so using default one for now.
-      - "50010:50010"
+      - 2222
+    volumes:
+      - ./remotes/user.key.pub:/tmp/key
+      - ./remotes/git-init:/config/custom-cont-init.d

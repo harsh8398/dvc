@@ -1,8 +1,6 @@
 import logging
 import os
 
-import shortuuid
-
 from dvc.exceptions import DvcException
 from dvc.utils import resolve_output
 from dvc.utils.fs import remove
@@ -13,13 +11,14 @@ logger = logging.getLogger(__name__)
 class GetDVCFileError(DvcException):
     def __init__(self):
         super().__init__(
-            "the given path is a DVC-file, you must specify a data file "
+            "the given path is a DVC file, you must specify a data file "
             "or a directory"
         )
 
 
-@staticmethod
-def get(url, path, out=None, rev=None):
+def get(url, path, out=None, rev=None, jobs=None):
+    import shortuuid
+
     from dvc.dvcfile import is_valid_filename
     from dvc.external_repo import external_repo
 
@@ -50,6 +49,9 @@ def get(url, path, out=None, rev=None):
         with external_repo(
             url=url, rev=rev, cache_dir=tmp_dir, cache_types=cache_types
         ) as repo:
-            repo.get_external(path, out)
+            from_fs_path = os.path.abspath(os.path.join(repo.root_dir, path))
+            repo.repo_fs.download(
+                from_fs_path, os.path.abspath(out), jobs=jobs
+            )
     finally:
         remove(tmp_dir)

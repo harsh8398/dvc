@@ -1,13 +1,17 @@
+import logging
 import os
 from collections import defaultdict
 
 import dpath.util
 from voluptuous import Any
 
-from dvc.dependency.local import LocalDependency
 from dvc.exceptions import DvcException
 from dvc.hash_info import HashInfo
 from dvc.utils.serialize import LOADERS, ParseError
+
+from .base import Dependency
+
+logger = logging.getLogger(__name__)
 
 
 class MissingParamsError(DvcException):
@@ -18,7 +22,7 @@ class BadParamFileError(DvcException):
     pass
 
 
-class ParamsDependency(LocalDependency):
+class ParamsDependency(Dependency):
     PARAM_PARAMS = "params"
     PARAM_SCHEMA = {PARAM_PARAMS: Any(dict, list, None)}
     DEFAULT_PARAMS_FILE = "params.yaml"
@@ -84,18 +88,33 @@ class ParamsDependency(LocalDependency):
     def status(self):
         return self.workspace_status()
 
-    def read_params(self):
+    def _read(self):
         if not self.exists:
             return {}
 
-        suffix = self.path_info.suffix.lower()
+        suffix = self.repo.fs.path.suffix(self.fs_path).lower()
         loader = LOADERS[suffix]
         try:
-            config = loader(self.path_info, tree=self.repo.tree)
+            return loader(self.fs_path, fs=self.repo.fs)
         except ParseError as exc:
             raise BadParamFileError(
                 f"Unable to read parameters from '{self}'"
             ) from exc
+
+    def read_params_d(self, **kwargs):
+        config = self._read()
+
+        ret = {}
+        for param in self.params:
+            dpath.util.merge(
+                ret,
+                dpath.util.search(config, param, separator="."),
+                separator=".",
+            )
+        return ret
+
+    def read_params(self):
+        config = self._read()
 
         ret = {}
         for param in self.params:
@@ -112,8 +131,25 @@ class ParamsDependency(LocalDependency):
         if missing_params:
             raise MissingParamsError(
                 "Parameters '{}' are missing from '{}'.".format(
-                    ", ".join(missing_params), self,
+                    ", ".join(missing_params), self
                 )
             )
 
         return HashInfo(self.PARAM_PARAMS, info)
+
+    def save(self):
+        if not self.exists:
+            raise self.DoesNotExistError(self)
+
+        if not self.isfile and not self.isdir:
+            raise self.IsNotFileOrDirError(self)
+
+        if self.is_empty:
+            logger.warning(f"'{self}' is empty.")
+
+        self.ignore()
+
+        if self.metric or self.plot:
+            self.verify_metric()
+
+        self.hash_info = self.get_hash()

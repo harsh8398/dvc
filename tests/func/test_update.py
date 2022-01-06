@@ -3,21 +3,11 @@ import os
 import pytest
 
 from dvc.dvcfile import Dvcfile
-from tests.unit.tree.test_repo import make_subrepo
+from dvc.exceptions import InvalidArgumentError
+from tests.unit.fs.test_repo import make_subrepo
 
 
-@pytest.mark.parametrize(
-    "cached",
-    [
-        True,
-        pytest.param(
-            False,
-            marks=pytest.mark.skip(
-                reason="https://github.com/iterative/dvc/issues/4418"
-            ),
-        ),
-    ],
-)
+@pytest.mark.parametrize("cached", [True, False])
 def test_update_import(tmp_dir, dvc, erepo_dir, cached):
     gen = erepo_dir.dvc_gen if cached else erepo_dir.scm_gen
 
@@ -106,7 +96,7 @@ def test_update_import_after_remote_updates_to_dvc(tmp_dir, dvc, erepo_dir):
 
     new_rev = None
     with erepo_dir.branch("branch", new=False), erepo_dir.chdir():
-        erepo_dir.scm.repo.index.remove(["version"])
+        erepo_dir.scm.gitpython.repo.index.remove(["version"])
         erepo_dir.dvc_gen(
             "version", "updated", commit="upgrade to DVC tracking"
         )
@@ -143,7 +133,7 @@ def test_update_before_and_after_dvc_init(tmp_dir, dvc, git_dir):
 
     with git_dir.chdir():
         git_dir.init(dvc=True)
-        git_dir.scm.repo.index.remove(["file"])
+        git_dir.scm.gitpython.repo.index.remove(["file"])
         os.remove("file")
         git_dir.dvc_gen("file", "second version", commit="with dvc")
         new_rev = git_dir.scm.get_rev()
@@ -154,7 +144,7 @@ def test_update_before_and_after_dvc_init(tmp_dir, dvc, git_dir):
         "file.dvc": [
             {
                 "changed deps": {
-                    "file ({})".format(os.fspath(git_dir)): "update available"
+                    f"file ({os.fspath(git_dir)})": "update available"
                 }
             }
         ]
@@ -166,22 +156,6 @@ def test_update_before_and_after_dvc_init(tmp_dir, dvc, git_dir):
     assert dvc.status([stage.path]) == {}
 
 
-@pytest.mark.parametrize(
-    "workspace",
-    [
-        pytest.lazy_fixture("local_cloud"),
-        pytest.lazy_fixture("s3"),
-        pytest.lazy_fixture("gs"),
-        pytest.lazy_fixture("hdfs"),
-        pytest.param(
-            pytest.lazy_fixture("ssh"),
-            marks=pytest.mark.skipif(
-                os.name == "nt", reason="disabled on windows"
-            ),
-        ),
-    ],
-    indirect=True,
-)
 def test_update_import_url(tmp_dir, dvc, workspace):
     workspace.gen("file", "file content")
 
@@ -223,7 +197,7 @@ def test_update_rev(tmp_dir, dvc, scm, git_dir):
         "rev": "branch1",
         "rev_lock": branch1_head,
     }
-    with open(tmp_dir / "foo") as f:
+    with open(tmp_dir / "foo", encoding="utf-8") as f:
         assert "foobar" == f.read()
 
     stage = dvc.update(["foo.dvc"], rev="branch2")[0]
@@ -232,7 +206,7 @@ def test_update_rev(tmp_dir, dvc, scm, git_dir):
         "rev": "branch2",
         "rev_lock": branch2_head,
     }
-    with open(tmp_dir / "foo") as f:
+    with open(tmp_dir / "foo", encoding="utf-8") as f:
         assert "foobar foo" == f.read()
 
 
@@ -246,10 +220,7 @@ def test_update_recursive(tmp_dir, dvc, erepo_dir):
 
     tmp_dir.gen({"dir": {"subdir": {}}})
     stage1 = dvc.imp(
-        os.fspath(erepo_dir),
-        "foo1",
-        os.path.join("dir", "foo1"),
-        rev="branch",
+        os.fspath(erepo_dir), "foo1", os.path.join("dir", "foo1"), rev="branch"
     )
     stage2 = dvc.imp(
         os.fspath(erepo_dir),
@@ -322,4 +293,98 @@ def test_update_from_subrepos(tmp_dir, dvc, erepo_dir, is_dvc):
     assert stage.deps[0].def_repo == {
         "url": repo_path,
         "rev_lock": erepo_dir.scm.get_rev(),
+    }
+
+
+def test_update_import_to_remote(tmp_dir, dvc, erepo_dir, local_remote):
+    erepo_dir.scm_gen({"foo": "foo"}, commit="add foo")
+    stage = dvc.imp(os.fspath(erepo_dir), "foo")
+    erepo_dir.scm_gen({"foo": "bar"}, commit="update foo")
+    with pytest.raises(InvalidArgumentError):
+        dvc.update(stage.path, to_remote=True)
+
+
+def test_update_import_url_to_remote(tmp_dir, dvc, workspace, local_remote):
+    workspace.gen("foo", "foo")
+    stage = dvc.imp_url("remote://workspace/foo", to_remote=True)
+
+    workspace.gen("foo", "bar")
+    stage = dvc.update(stage.path, to_remote=True)
+
+    dvc.pull("foo")
+    assert (tmp_dir / "foo").read_text() == "bar"
+
+
+def test_update_import_url_to_remote_directory(
+    mocker, tmp_dir, dvc, workspace, local_remote
+):
+    workspace.gen({"data": {"foo": "foo", "bar": {"baz": "baz"}}})
+    stage = dvc.imp_url("remote://workspace/data", to_remote=True)
+
+    workspace.gen(
+        {
+            "data": {
+                "foo2": "foo2",
+                "bar": {"baz2": "baz2"},
+                "repeated_hashes": {
+                    "foo": "foo",
+                    "baz": "baz",
+                    "foo_with_different_name": "foo",
+                },
+            }
+        }
+    )
+
+    stage = dvc.update(stage.path, to_remote=True)
+
+    dvc.pull("data")
+    assert (tmp_dir / "data").read_text() == {
+        "foo": "foo",
+        "foo2": "foo2",
+        "bar": {"baz": "baz", "baz2": "baz2"},
+        "repeated_hashes": {
+            "foo": "foo",
+            "baz": "baz",
+            "foo_with_different_name": "foo",
+        },
+    }
+
+
+def test_update_import_url_to_remote_directory_changed_contents(
+    tmp_dir, dvc, local_workspace, local_remote
+):
+    local_workspace.gen({"data": {"foo": "foo", "bar": {"baz": "baz"}}})
+    stage = dvc.imp_url("remote://workspace/data", to_remote=True)
+
+    local_workspace.gen(
+        {"data": {"foo": "not_foo", "foo2": "foo", "bar": {"baz2": "baz2"}}}
+    )
+    stage = dvc.update(stage.path, to_remote=True)
+
+    dvc.pull("data")
+    assert (tmp_dir / "data").read_text() == {
+        "foo": "not_foo",
+        "foo2": "foo",
+        "bar": {"baz": "baz", "baz2": "baz2"},
+    }
+
+
+def test_update_import_url_to_remote_directory_same_hash(
+    tmp_dir, dvc, local_workspace, local_remote
+):
+    local_workspace.gen(
+        {"data": {"foo": "foo", "bar": {"baz": "baz"}, "same": "same"}}
+    )
+    stage = dvc.imp_url("remote://workspace/data", to_remote=True)
+
+    local_workspace.gen(
+        {"data": {"foo": "baz", "bar": {"baz": "foo"}, "same": "same"}}
+    )
+    stage = dvc.update(stage.path, to_remote=True)
+
+    dvc.pull("data")
+    assert (tmp_dir / "data").read_text() == {
+        "foo": "baz",
+        "bar": {"baz": "foo"},
+        "same": "same",
     }

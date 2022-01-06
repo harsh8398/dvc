@@ -5,7 +5,6 @@ import pytest
 
 from dvc.exceptions import InvalidArgumentError
 from dvc.stage.exceptions import DuplicateStageName, InvalidStageName
-from dvc.utils.serialize import dump_yaml, parse_yaml_for_update
 
 
 def test_run_with_name(tmp_dir, dvc, run_copy):
@@ -34,14 +33,10 @@ def test_run_no_exec(tmp_dir, dvc, run_copy):
     assert not os.path.exists(PIPELINE_LOCK)
 
     data, _ = stage.dvcfile._load()
-    assert data == {
-        "stages": {
-            "copy-foo-to-bar": {
-                "cmd": "python copy.py foo bar",
-                "deps": ["copy.py", "foo"],
-                "outs": ["bar"],
-            }
-        }
+    assert data["stages"]["copy-foo-to-bar"] == {
+        "cmd": "python copy.py foo bar",
+        "deps": ["copy.py", "foo"],
+        "outs": ["bar"],
     }
 
 
@@ -77,13 +72,15 @@ def test_run_multi_stage_repeat(tmp_dir, dvc, run_copy):
     }
 
 
-def test_multi_stage_run_cached(tmp_dir, dvc, run_copy):
+def test_multi_stage_run_cached(tmp_dir, dvc, run_copy, mocker):
+    from dvc.stage.run import subprocess
+
     tmp_dir.dvc_gen("foo", "foo")
 
     run_copy("foo", "foo2", name="copy-foo1-foo2")
-    stage2 = run_copy("foo", "foo2", name="copy-foo1-foo2")
-
-    assert stage2 is None
+    spy = mocker.spy(subprocess, "Popen")
+    run_copy("foo", "foo2", name="copy-foo1-foo2")
+    assert not spy.called
 
 
 def test_multistage_dump_on_non_cached_outputs(tmp_dir, dvc):
@@ -171,7 +168,7 @@ def test_run_dump_on_multistage(tmp_dir, dvc, run_head):
                 "outs": [{"foo2": {"persist": True}}],
                 "always_changed": True,
                 "wdir": "dir",
-            },
+            }
         }
     }
 
@@ -234,7 +231,7 @@ supported_params = {
 def test_run_params_default(tmp_dir, dvc):
     from dvc.dependency import ParamsDependency
 
-    dump_yaml(tmp_dir / "params.yaml", supported_params)
+    (tmp_dir / "params.yaml").dump(supported_params)
     stage = dvc.run(
         name="read_params",
         params=["nested.nested1.nested2"],
@@ -244,7 +241,7 @@ def test_run_params_default(tmp_dir, dvc):
     assert stage.deps[0].params == ["nested.nested1.nested2"]
 
     lockfile = stage.dvcfile._lockfile
-    assert lockfile.load()["read_params"]["params"] == {
+    assert lockfile.load()["stages"]["read_params"]["params"] == {
         "params.yaml": {"nested.nested1.nested2": "42"}
     }
 
@@ -257,7 +254,7 @@ def test_run_params_default(tmp_dir, dvc):
 def test_run_params_custom_file(tmp_dir, dvc):
     from dvc.dependency import ParamsDependency
 
-    dump_yaml(tmp_dir / "params2.yaml", supported_params)
+    (tmp_dir / "params2.yaml").dump(supported_params)
     stage = dvc.run(
         name="read_params",
         params=["params2.yaml:lists"],
@@ -267,7 +264,7 @@ def test_run_params_custom_file(tmp_dir, dvc):
     isinstance(stage.deps[0], ParamsDependency)
     assert stage.deps[0].params == ["lists"]
     lockfile = stage.dvcfile._lockfile
-    assert lockfile.load()["read_params"]["params"] == {
+    assert lockfile.load()["stages"]["read_params"]["params"] == {
         "params2.yaml": {"lists": [42, 42.0, "42"]}
     }
 
@@ -280,7 +277,7 @@ def test_run_params_custom_file(tmp_dir, dvc):
 def test_run_params_no_exec(tmp_dir, dvc):
     from dvc.dependency import ParamsDependency
 
-    dump_yaml(tmp_dir / "params2.yaml", supported_params)
+    (tmp_dir / "params2.yaml").dump(supported_params)
     stage = dvc.run(
         name="read_params",
         params=["params2.yaml:lists"],
@@ -320,9 +317,7 @@ def test_run_overwrite_order(tmp_dir, dvc, run_copy):
 
     run_copy("foo1", "bar1", name="copy-foo-bar", force=True)
 
-    data = parse_yaml_for_update(
-        (tmp_dir / PIPELINE_FILE).read_text(), PIPELINE_FILE
-    )
+    data = (tmp_dir / PIPELINE_FILE).parse()
     assert list(data["stages"].keys()) == ["copy-foo-bar", "copy-bar-foobar"]
 
 
@@ -355,49 +350,16 @@ def test_run_overwrite_preserves_meta_and_comment(tmp_dir, dvc, run_copy):
     )
 
 
-@pytest.mark.parametrize(
-    "workspace, hash_name, foo_hash, bar_hash",
-    [
-        (
-            pytest.lazy_fixture("local_cloud"),
-            "md5",
-            "acbd18db4cc2f85cedef654fccc4a4d8",
-            "37b51d194a7513e45b56f6524f2d51f2",
-        ),
-        pytest.param(
-            pytest.lazy_fixture("ssh"),
-            "md5",
-            "acbd18db4cc2f85cedef654fccc4a4d8",
-            "37b51d194a7513e45b56f6524f2d51f2",
-            marks=pytest.mark.skipif(
-                os.name == "nt", reason="disabled on windows"
-            ),
-        ),
-        (
-            pytest.lazy_fixture("s3"),
-            "etag",
-            "acbd18db4cc2f85cedef654fccc4a4d8",
-            "37b51d194a7513e45b56f6524f2d51f2",
-        ),
-        (
-            pytest.lazy_fixture("gs"),
-            "md5",
-            "acbd18db4cc2f85cedef654fccc4a4d8",
-            "37b51d194a7513e45b56f6524f2d51f2",
-        ),
-        (
-            pytest.lazy_fixture("hdfs"),
-            "checksum",
-            "0000020000000000000000003dba826b9be9c6a8e2f8310a770555c4",
-            "00000200000000000000000075433c81259d3c38e364b348af52e84d",
-        ),
-    ],
-    indirect=["workspace"],
-)
 def test_run_external_outputs(
-    tmp_dir, dvc, workspace, hash_name, foo_hash, bar_hash
+    tmp_dir,
+    dvc,
+    local_workspace,
 ):
-    workspace.gen("foo", "foo")
+    hash_name = "md5"
+    foo_hash = "acbd18db4cc2f85cedef654fccc4a4d8"
+    bar_hash = "37b51d194a7513e45b56f6524f2d51f2"
+
+    local_workspace.gen("foo", "foo")
     dvc.run(
         name="mystage",
         cmd="mycmd",
@@ -419,23 +381,27 @@ def test_run_external_outputs(
     assert (tmp_dir / "dvc.yaml").read_text() == dvc_yaml
     assert not (tmp_dir / "dvc.lock").exists()
 
-    workspace.gen("bar", "bar")
+    local_workspace.gen("bar", "bar")
     dvc.commit("dvc.yaml", force=True)
 
     assert (tmp_dir / "dvc.yaml").read_text() == dvc_yaml
     assert (tmp_dir / "dvc.lock").read_text() == (
-        "mystage:\n"
-        "  cmd: mycmd\n"
-        "  deps:\n"
-        "  - path: remote://workspace/foo\n"
-        f"    {hash_name}: {foo_hash}\n"
-        "  outs:\n"
-        "  - path: remote://workspace/bar\n"
-        f"    {hash_name}: {bar_hash}\n"
+        "schema: '2.0'\n"
+        "stages:\n"
+        "  mystage:\n"
+        "    cmd: mycmd\n"
+        "    deps:\n"
+        "    - path: remote://workspace/foo\n"
+        f"      {hash_name}: {foo_hash}\n"
+        "      size: 3\n"
+        "    outs:\n"
+        "    - path: remote://workspace/bar\n"
+        f"      {hash_name}: {bar_hash}\n"
+        "      size: 3\n"
     )
 
-    assert (workspace / "foo").read_text() == "foo"
-    assert (workspace / "bar").read_text() == "bar"
+    assert (local_workspace / "foo").read_text() == "foo"
+    assert (local_workspace / "bar").read_text() == "bar"
     assert (
-        workspace / "cache" / bar_hash[:2] / bar_hash[2:]
+        local_workspace / "cache" / bar_hash[:2] / bar_hash[2:]
     ).read_text() == "bar"

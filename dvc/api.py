@@ -1,16 +1,9 @@
 import os
 from contextlib import _GeneratorContextManager as GCM
-from contextlib import contextmanager
 
 from funcy import reraise
 
-from dvc.exceptions import (
-    NotDvcRepoError,
-    OutputNotFoundError,
-    PathMissingError,
-)
-from dvc.external_repo import external_repo
-from dvc.path_info import PathInfo
+from dvc.exceptions import OutputNotFoundError, PathMissingError
 from dvc.repo import Repo
 
 
@@ -20,23 +13,22 @@ def get_url(path, repo=None, rev=None, remote=None):
     in a DVC repo. For Git repos, HEAD is used unless a rev argument is
     supplied. The default remote is tried unless a remote argument is supplied.
 
-    Raises OutputNotFoundError if the file is not a dvc-tracked file.
+    Raises OutputNotFoundError if the file is not tracked by DVC.
 
     NOTE: This function does not check for the actual existence of the file or
     directory in the remote storage.
     """
-    with _make_repo(repo, rev=rev) as _repo:
-        path_info = PathInfo(_repo.root_dir) / path
+    with Repo.open(repo, rev=rev, subrepos=True, uninitialized=True) as _repo:
+        fs_path = _repo.fs.path.join(_repo.root_dir, path)
         with reraise(FileNotFoundError, PathMissingError(path, repo)):
-            metadata = _repo.repo_tree.metadata(path_info)
+            metadata = _repo.repo_fs.metadata(fs_path)
 
         if not metadata.is_dvc:
             raise OutputNotFoundError(path, repo)
 
         cloud = metadata.repo.cloud
-        with _repo.state:
-            hash_info = _repo.repo_tree.get_hash(path_info)
-        return cloud.get_url_for(remote, checksum=hash_info.value)
+        md5 = metadata.repo.dvcfs.info(fs_path)["md5"]
+        return cloud.get_url_for(remote, checksum=md5)
 
 
 def open(  # noqa, pylint: disable=redefined-builtin
@@ -79,7 +71,7 @@ class _OpenContextManager(GCM):
 
 
 def _open(path, repo=None, rev=None, remote=None, mode="r", encoding=None):
-    with _make_repo(repo, rev=rev) as _repo:
+    with Repo.open(repo, rev=rev, subrepos=True, uninitialized=True) as _repo:
         with _repo.open_by_relpath(
             path, remote=remote, mode=mode, encoding=encoding
         ) as fd:
@@ -98,19 +90,6 @@ def read(path, repo=None, rev=None, remote=None, mode="r", encoding=None):
         return fd.read()
 
 
-@contextmanager
-def _make_repo(repo_url=None, rev=None):
-    repo_url = repo_url or os.getcwd()
-    if rev is None and os.path.exists(repo_url):
-        try:
-            yield Repo(repo_url, subrepos=True)
-            return
-        except NotDvcRepoError:
-            pass  # fallthrough to external_repo
-    with external_repo(url=repo_url, rev=rev) as repo:
-        yield repo
-
-
 def make_checkpoint():
     """
     Signal DVC to create a checkpoint experiment.
@@ -122,21 +101,22 @@ def make_checkpoint():
     import builtins
     from time import sleep
 
-    from dvc.stage.run import CHECKPOINT_SIGNAL_FILE
+    from dvc.env import DVC_CHECKPOINT, DVC_ROOT
+    from dvc.stage.monitor import CheckpointTask
 
-    if os.getenv("DVC_CHECKPOINT") is None:
+    if os.getenv(DVC_CHECKPOINT) is None:
         return
 
-    root_dir = Repo.find_root()
+    root_dir = os.getenv(DVC_ROOT, Repo.find_root())
     signal_file = os.path.join(
-        root_dir, Repo.DVC_DIR, "tmp", CHECKPOINT_SIGNAL_FILE
+        root_dir, Repo.DVC_DIR, "tmp", CheckpointTask.SIGNAL_FILE
     )
 
-    with builtins.open(signal_file, "w") as fobj:
+    with builtins.open(signal_file, "w", encoding="utf-8") as fobj:
         # NOTE: force flushing/writing empty file to disk, otherwise when
         # run in certain contexts (pytest) file may not actually be written
         fobj.write("")
         fobj.flush()
         os.fsync(fobj.fileno())
     while os.path.exists(signal_file):
-        sleep(1)
+        sleep(0.1)

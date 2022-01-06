@@ -3,10 +3,13 @@ from collections.abc import Mapping
 from copy import deepcopy
 from itertools import chain
 
-from funcy import get_in, lcat, project
+from funcy import cached_property, get_in, lcat, once, project
 
 from dvc import dependency, output
 from dvc.hash_info import HashInfo
+from dvc.objects.meta import Meta
+from dvc.parsing import FOREACH_KWD, JOIN, DataResolver, EntryNotFound
+from dvc.parsing.versions import LOCKFILE_VERSION
 
 from . import PipelineStage, Stage, loads_from
 from .exceptions import StageNameUnspecified, StageNotFound
@@ -17,10 +20,29 @@ logger = logging.getLogger(__name__)
 
 
 class StageLoader(Mapping):
-    def __init__(self, dvcfile, stages_data, lockfile_data=None):
+    def __init__(self, dvcfile, data, lockfile_data=None):
         self.dvcfile = dvcfile
-        self.stages_data = stages_data or {}
-        self.lockfile_data = lockfile_data or {}
+        self.data = data or {}
+        self.stages_data = self.data.get("stages", {})
+        self.repo = self.dvcfile.repo
+
+        lockfile_data = lockfile_data or {}
+        version = LOCKFILE_VERSION.from_dict(lockfile_data)
+        if version == LOCKFILE_VERSION.V1:
+            self._lockfile_data = lockfile_data
+        else:
+            self._lockfile_data = lockfile_data.get("stages", {})
+
+    @cached_property
+    def resolver(self):
+        wdir = self.repo.fs.path.parent(self.dvcfile.path)
+        return DataResolver(self.repo, wdir, self.data)
+
+    @cached_property
+    def lockfile_data(self):
+        if not self._lockfile_data:
+            logger.debug("Lockfile for '%s' not found", self.dvcfile.relpath)
+        return self._lockfile_data
 
     @staticmethod
     def fill_from_lock(stage, lock_data=None):
@@ -46,6 +68,8 @@ class StageLoader(Mapping):
             info = get_in(checksums, [key, path], {})
             info = info.copy()
             info.pop("path", None)
+            item.isexec = info.pop("isexec", None)
+            item.meta = Meta.from_dict(info)
             item.hash_info = HashInfo.from_dict(info)
 
     @classmethod
@@ -58,13 +82,20 @@ class StageLoader(Mapping):
         )
         stage = loads_from(PipelineStage, dvcfile.repo, path, wdir, stage_data)
         stage.name = name
+        stage.desc = stage_data.get(Stage.PARAM_DESC)
+        stage.meta = stage_data.get(Stage.PARAM_META)
 
         deps = project(stage_data, [stage.PARAM_DEPS, stage.PARAM_PARAMS])
         fill_stage_dependencies(stage, **deps)
 
         outs = project(
             stage_data,
-            [stage.PARAM_OUTS, stage.PARAM_METRICS, stage.PARAM_PLOTS],
+            [
+                stage.PARAM_OUTS,
+                stage.PARAM_METRICS,
+                stage.PARAM_PLOTS,
+                stage.PARAM_LIVE,
+            ],
         )
         stage.outs = lcat(
             output.load_from_pipeline(stage, data, typ=key)
@@ -77,33 +108,60 @@ class StageLoader(Mapping):
         cls.fill_from_lock(stage, lock_data)
         return stage
 
+    @once
+    def lockfile_needs_update(self):
+        # if lockfile does not have all of the entries that dvc.yaml says it
+        # should have, provide a debug message once
+        # pylint: disable=protected-access
+        lockfile = self.dvcfile._lockfile.relpath
+        logger.debug("Lockfile '%s' needs to be updated.", lockfile)
+
     def __getitem__(self, name):
         if not name:
             raise StageNameUnspecified(self.dvcfile)
 
-        if name not in self:
+        try:
+            resolved_data = self.resolver.resolve_one(name)
+        except EntryNotFound:
             raise StageNotFound(self.dvcfile, name)
 
-        if not self.lockfile_data.get(name):
-            logger.debug(
-                "No lock entry found for '%s:%s'", self.dvcfile.relpath, name,
+        if self.lockfile_data and name not in self.lockfile_data:
+            self.lockfile_needs_update()
+            logger.trace(  # type: ignore[attr-defined]
+                "No lock entry found for '%s:%s'", self.dvcfile.relpath, name
             )
 
-        return self.load_stage(
+        resolved_stage = resolved_data[name]
+        stage = self.load_stage(
             self.dvcfile,
             name,
-            self.stages_data[name],
+            resolved_stage,
             self.lockfile_data.get(name, {}),
         )
 
+        stage.tracked_vars = self.resolver.tracked_vars.get(name, {})
+        group, *keys = name.rsplit(JOIN, maxsplit=1)
+        if group and keys and name not in self.stages_data:
+            stage.raw_data.generated_from = group
+
+        stage.raw_data.parametrized = (
+            self.stages_data.get(name, {}) != resolved_stage
+        )
+        return stage
+
     def __iter__(self):
-        return iter(self.stages_data)
+        return iter(self.resolver.get_keys())
 
     def __len__(self):
-        return len(self.stages_data)
+        return len(self.resolver.get_keys())
 
     def __contains__(self, name):
-        return name in self.stages_data
+        return self.resolver.has_key(name)  # noqa: W601
+
+    def is_foreach_generated(self, name: str):
+        return (
+            name in self.stages_data and FOREACH_KWD in self.stages_data[name]
+        )
 
 
 class SingleStageLoader(Mapping):

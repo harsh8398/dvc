@@ -1,4 +1,4 @@
-from dvc.tree.oss import OSSTree
+from dvc.fs.oss import OSSFileSystem
 
 bucket_name = "bucket-name"
 endpoint = "endpoint"
@@ -15,8 +15,7 @@ def test_init(dvc):
         "oss_key_secret": key_secret,
         "oss_endpoint": endpoint,
     }
-    tree = OSSTree(dvc, config)
-    assert tree.path_info == url
-    assert tree.endpoint == endpoint
-    assert tree.key_id == key_id
-    assert tree.key_secret == key_secret
+    fs = OSSFileSystem(**config)
+    assert fs.fs_args["endpoint"] == endpoint
+    assert fs.fs_args["key"] == key_id
+    assert fs.fs_args["secret"] == key_secret

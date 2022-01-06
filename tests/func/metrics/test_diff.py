@@ -1,8 +1,6 @@
 import json
-import logging
 
 from dvc.main import main
-from dvc.utils.serialize import dump_yaml
 
 
 def test_metrics_diff_simple(tmp_dir, scm, dvc, run_copy_metrics):
@@ -23,7 +21,7 @@ def test_metrics_diff_simple(tmp_dir, scm, dvc, run_copy_metrics):
 def test_metrics_diff_yaml(tmp_dir, scm, dvc, run_copy_metrics):
     def _gen(val):
         metrics = {"a": {"b": {"c": val, "d": 1, "e": str(val)}}}
-        dump_yaml("m_temp.yaml", metrics)
+        (tmp_dir / "m_temp.yaml").dump(metrics)
         run_copy_metrics(
             "m_temp.yaml", "m.yaml", metrics=["m.yaml"], commit=str(val)
         )
@@ -40,7 +38,7 @@ def test_metrics_diff_yaml(tmp_dir, scm, dvc, run_copy_metrics):
 def test_metrics_diff_json(tmp_dir, scm, dvc, run_copy_metrics):
     def _gen(val):
         metrics = {"a": {"b": {"c": val, "d": 1, "e": str(val)}}}
-        tmp_dir.gen({"m_temp.json": json.dumps(metrics)})
+        (tmp_dir / "m_temp.json").dump(metrics)
         run_copy_metrics(
             "m_temp.json", "m.json", metrics=["m.json"], commit=str(val)
         )
@@ -56,7 +54,7 @@ def test_metrics_diff_json(tmp_dir, scm, dvc, run_copy_metrics):
 def test_metrics_diff_json_unchanged(tmp_dir, scm, dvc, run_copy_metrics):
     def _gen(val):
         metrics = {"a": {"b": {"c": val, "d": 1, "e": str(val)}}}
-        tmp_dir.gen({"m_temp.json": json.dumps(metrics)})
+        (tmp_dir / "m_temp.json").dump(metrics)
         run_copy_metrics(
             "m_temp.json", "m.json", metrics=["m.json"], commit=str(val)
         )
@@ -70,7 +68,7 @@ def test_metrics_diff_json_unchanged(tmp_dir, scm, dvc, run_copy_metrics):
 
 def test_metrics_diff_broken_json(tmp_dir, scm, dvc, run_copy_metrics):
     metrics = {"a": {"b": {"c": 1, "d": 1, "e": "3"}}}
-    tmp_dir.gen({"m_temp.json": json.dumps(metrics)})
+    (tmp_dir / "m_temp.json").dump(metrics)
     run_copy_metrics(
         "m_temp.json",
         "m.json",
@@ -95,7 +93,7 @@ def test_metrics_diff_no_metrics(tmp_dir, scm, dvc):
 
 def test_metrics_diff_new_metric(tmp_dir, scm, dvc, run_copy_metrics):
     metrics = {"a": {"b": {"c": 1, "d": 1, "e": "3"}}}
-    tmp_dir.gen({"m_temp.json": json.dumps(metrics)})
+    (tmp_dir / "m_temp.json").dump(metrics)
     run_copy_metrics("m_temp.json", "m.json", metrics_no_cache=["m.json"])
 
     assert dvc.metrics.diff() == {
@@ -108,7 +106,7 @@ def test_metrics_diff_new_metric(tmp_dir, scm, dvc, run_copy_metrics):
 
 def test_metrics_diff_deleted_metric(tmp_dir, scm, dvc, run_copy_metrics):
     metrics = {"a": {"b": {"c": 1, "d": 1, "e": "3"}}}
-    tmp_dir.gen({"m_temp.json": json.dumps(metrics)})
+    (tmp_dir / "m_temp.json").dump(metrics)
     run_copy_metrics(
         "m_temp.json",
         "m.json",
@@ -147,8 +145,9 @@ def test_metrics_diff_with_unchanged(tmp_dir, scm, dvc, run_copy_metrics):
 
 
 def test_no_commits(tmp_dir):
+    from scmrepo.git import Git
+
     from dvc.repo import Repo
-    from dvc.scm.git import Git
     from tests.dir_helpers import git_init
 
     git_init(".")
@@ -185,15 +184,14 @@ def test_metrics_diff_cli(tmp_dir, scm, dvc, run_copy_metrics, caplog, capsys):
     _gen(3.45678910111213)
 
     caplog.clear()
+    capsys.readouterr()  # clearing the buffer
     assert main(["metrics", "diff", "HEAD~2"]) == 0
-    (info,) = [
-        msg
-        for name, level, msg in caplog.record_tuples
-        if name.startswith("dvc") and level == logging.INFO
-    ]
-    assert info == (
-        "Path    Metric    Old      New      Change\n"
-        "m.yaml  foo       1.23457  3.45679  2.22222"
+
+    captured = capsys.readouterr()
+
+    assert captured.out == (
+        "Path    Metric    HEAD~2    workspace    Change\n"
+        "m.yaml  foo       1.23457   3.45679      2.22222\n"
     )
 
 

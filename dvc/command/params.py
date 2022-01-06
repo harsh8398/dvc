@@ -1,55 +1,44 @@
 import argparse
 import logging
-from collections import OrderedDict
 
+from dvc.command import completion
 from dvc.command.base import CmdBase, append_doc_link, fix_subparsers
 from dvc.exceptions import DvcException
+from dvc.ui import ui
 
 logger = logging.getLogger(__name__)
 
 
-def _show_diff(diff, markdown=False, no_path=False):
-    from dvc.utils.diff import table
-
-    rows = []
-    for fname, pdiff in diff.items():
-        sorted_pdiff = OrderedDict(sorted(pdiff.items()))
-        for param, change in sorted_pdiff.items():
-            row = [] if no_path else [fname]
-            row.append(param)
-            row.append(change["old"])
-            row.append(change["new"])
-            rows.append(row)
-
-    header = [] if no_path else ["Path"]
-    header.append("Param")
-    header.append("Old")
-    header.append("New")
-
-    return table(header, rows, markdown)
-
-
 class CmdParamsDiff(CmdBase):
+    UNINITIALIZED = True
+
     def run(self):
         try:
             diff = self.repo.params.diff(
                 a_rev=self.args.a_rev,
                 b_rev=self.args.b_rev,
+                targets=self.args.targets,
                 all=self.args.all,
+                deps=self.args.deps,
             )
-
-            if self.args.show_json:
-                import json
-
-                logger.info(json.dumps(diff))
-            else:
-                table = _show_diff(diff, self.args.show_md, self.args.no_path)
-                if table:
-                    logger.info(table)
-
         except DvcException:
             logger.exception("failed to show params diff")
             return 1
+
+        if self.args.json:
+            ui.write_json(diff)
+        else:
+            from dvc.compare import show_diff
+
+            show_diff(
+                diff,
+                title="Param",
+                markdown=self.args.markdown,
+                no_path=self.args.no_path,
+                show_changes=False,
+                a_rev=self.args.a_rev,
+                b_rev=self.args.b_rev,
+            )
 
         return 0
 
@@ -92,21 +81,40 @@ def add_parser(subparsers, parent_parser):
         help=("New Git commit to compare (defaults to the current workspace)"),
     )
     params_diff_parser.add_argument(
+        "--targets",
+        nargs="*",
+        help=(
+            "Specific params file(s) to compare "
+            "(even if not found as `params` in `dvc.yaml`). "
+            "Shows all tracked params by default."
+        ),
+        metavar="<paths>",
+    ).complete = completion.FILE
+    params_diff_parser.add_argument(
         "--all",
         action="store_true",
         default=False,
         help="Show unchanged params as well.",
     )
     params_diff_parser.add_argument(
+        "--deps",
+        action="store_true",
+        default=False,
+        help="Show only params that are stage dependencies.",
+    )
+    params_diff_parser.add_argument(
+        "--json",
         "--show-json",
         action="store_true",
         default=False,
         help="Show output in JSON format.",
     )
     params_diff_parser.add_argument(
+        "--md",
         "--show-md",
         action="store_true",
         default=False,
+        dest="markdown",
         help="Show tabulated output in the Markdown format (GFM).",
     )
     params_diff_parser.add_argument(

@@ -2,12 +2,19 @@ import logging
 import os
 import string
 from collections import defaultdict
+from contextlib import suppress
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict, Optional, Set
 
 from funcy import cached_property, project
 
-import dvc.dependency as dependency
-import dvc.prompt as prompt
-from dvc.exceptions import CheckoutError, DvcException, MergeError
+from dvc import prompt
+from dvc.exceptions import (
+    CacheLinkError,
+    CheckoutError,
+    DvcException,
+    MergeError,
+)
 from dvc.utils import relpath
 
 from . import params
@@ -25,12 +32,17 @@ from .utils import (
     fill_stage_dependencies,
     fill_stage_outputs,
     get_dump,
-    stage_dump_eq,
 )
+
+if TYPE_CHECKING:
+    from dvc.dvcfile import DVCFile
+    from dvc.hash_info import HashInfo
+    from dvc.objects.db.base import ObjectDB
 
 logger = logging.getLogger(__name__)
 # Disallow all punctuation characters except hyphen and underscore
 INVALID_STAGENAME_CHARS = set(string.punctuation) - {"_", "-"}
+Env = Dict[str, str]
 
 
 def loads_from(cls, repo, path, wdir, data):
@@ -46,6 +58,8 @@ def loads_from(cls, repo, path, wdir, data):
                 Stage.PARAM_FROZEN,
                 Stage.PARAM_ALWAYS_CHANGED,
                 Stage.PARAM_MD5,
+                Stage.PARAM_DESC,
+                Stage.PARAM_META,
                 "name",
             ],
         ),
@@ -53,12 +67,18 @@ def loads_from(cls, repo, path, wdir, data):
     return cls(**kw)
 
 
+@dataclass
+class RawData:
+    parametrized: bool = False
+    generated_from: Optional[str] = None
+
+
 def create_stage(cls, repo, path, external=False, **kwargs):
-    from dvc.dvcfile import check_dvc_filename
+    from dvc.dvcfile import check_dvcfile_path
 
     wdir = os.path.abspath(kwargs.get("wdir", None) or os.curdir)
     path = os.path.abspath(path)
-    check_dvc_filename(path)
+    check_dvcfile_path(repo, path)
     check_stage_path(repo, wdir, is_wdir=kwargs.get("wdir"))
     check_stage_path(repo, os.path.dirname(path))
 
@@ -72,19 +92,31 @@ def create_stage(cls, repo, path, external=False, **kwargs):
     check_circular_dependency(stage)
     check_duplicated_arguments(stage)
 
-    if stage and stage.dvcfile.exists():
-        has_persist_outs = any(out.persist for out in stage.outs)
-        ignore_run_cache = (
-            not kwargs.get("run_cache", True) or has_persist_outs
-        )
-        if has_persist_outs:
-            logger.warning("Build cache is ignored when persisting outputs.")
-
-        if not ignore_run_cache and stage.can_be_skipped:
-            logger.info("Stage is cached, skipping")
-            return None
-
     return stage
+
+
+def restore_meta(stage):
+    from .exceptions import StageNotFound
+
+    if not stage.dvcfile.exists():
+        return
+
+    try:
+        old = stage.reload()
+    except StageNotFound:
+        return
+
+    # will be used to restore comments later
+    # noqa, pylint: disable=protected-access
+    stage._stage_text = old._stage_text
+
+    stage.meta = old.meta
+    stage.desc = old.desc
+
+    old_desc = {out.def_path: out.desc for out in old.outs}
+
+    for out in stage.outs:
+        out.desc = old_desc.get(out.def_path, None)
 
 
 class Stage(params.StageParams):
@@ -105,6 +137,8 @@ class Stage(params.StageParams):
         always_changed=False,
         stage_text=None,
         dvcfile=None,
+        desc: Optional[str] = None,
+        meta=None,
     ):
         if deps is None:
             deps = []
@@ -122,19 +156,22 @@ class Stage(params.StageParams):
         self.always_changed = always_changed
         self._stage_text = stage_text
         self._dvcfile = dvcfile
+        self.desc: Optional[str] = desc
+        self.meta = meta
+        self.raw_data = RawData()
 
     @property
-    def path(self):
+    def path(self) -> str:
         return self._path
 
     @path.setter
-    def path(self, path):
+    def path(self, path: str):
         self._path = path
         self.__dict__.pop("path_in_repo", None)
         self.__dict__.pop("relpath", None)
 
     @property
-    def dvcfile(self):
+    def dvcfile(self) -> "DVCFile":
         if self.path and self._dvcfile and self.path == self._dvcfile.path:
             return self._dvcfile
 
@@ -144,13 +181,13 @@ class Stage(params.StageParams):
                 "and is detached from dvcfile."
             )
 
-        from dvc.dvcfile import Dvcfile
+        from dvc.dvcfile import make_dvcfile
 
-        self._dvcfile = Dvcfile(self.repo, self.path)
+        self._dvcfile = make_dvcfile(self.repo, self.path)
         return self._dvcfile
 
     @dvcfile.setter
-    def dvcfile(self, dvcfile):
+    def dvcfile(self, dvcfile: "DVCFile") -> None:
         self._dvcfile = dvcfile
 
     def __repr__(self):
@@ -160,7 +197,7 @@ class Stage(params.StageParams):
         return f"stage: '{self.addressing}'"
 
     @property
-    def addressing(self):
+    def addressing(self) -> str:
         """
         Useful for alternative presentations where we don't need
         `Stage:` prefix.
@@ -187,7 +224,7 @@ class Stage(params.StageParams):
 
     @property
     def is_data_source(self):
-        """Whether the DVC-file was created with `dvc add` or `dvc import`"""
+        """Whether the DVC file was created with `dvc add` or `dvc import`"""
         return self.cmd is None
 
     @property
@@ -196,11 +233,11 @@ class Stage(params.StageParams):
         A callback stage is always considered as changed,
         so it runs on every `dvc repro` call.
         """
-        return not self.is_data_source and len(self.deps) == 0
+        return self.cmd and not any((self.deps, self.outs))
 
     @property
     def is_import(self):
-        """Whether the DVC-file was created with `dvc import`."""
+        """Whether the DVC file was created with `dvc import`."""
         return not self.cmd and len(self.deps) == 1 and len(self.outs) == 1
 
     @property
@@ -208,26 +245,77 @@ class Stage(params.StageParams):
         if not self.is_import:
             return False
 
-        return isinstance(self.deps[0], dependency.RepoDependency)
+        from dvc.dependency import RepoDependency
+
+        return isinstance(self.deps[0], RepoDependency)
+
+    @property
+    def is_checkpoint(self):
+        """
+        A stage containing checkpoint outs is always considered as changed
+        since the checkpoint out is a circular dependency.
+        """
+        return any(out.checkpoint for out in self.outs)
+
+    def short_description(self) -> Optional["str"]:
+        desc: Optional["str"] = None
+        if self.desc:
+            with suppress(ValueError):
+                # try to use first non-empty line as a description
+                line = next(filter(None, self.desc.splitlines()))
+                desc = line.strip()
+        return desc
+
+    def _read_env(self, out, checkpoint_func=None) -> Env:
+        env: Env = {}
+        if out.live:
+            from dvc.env import DVCLIVE_HTML, DVCLIVE_PATH, DVCLIVE_SUMMARY
+            from dvc.output import Output
+            from dvc.schema import LIVE_PROPS
+
+            env[DVCLIVE_PATH] = relpath(out.fs_path, self.wdir)
+            if isinstance(out.live, dict):
+                config = project(out.live, LIVE_PROPS)
+
+                env[DVCLIVE_SUMMARY] = str(
+                    int(config.get(Output.PARAM_LIVE_SUMMARY, True))
+                )
+                env[DVCLIVE_HTML] = str(
+                    int(config.get(Output.PARAM_LIVE_HTML, True))
+                )
+        elif out.checkpoint and checkpoint_func:
+            from dvc.env import DVC_CHECKPOINT
+
+            env.update({DVC_CHECKPOINT: "1"})
+        return env
+
+    def env(self, checkpoint_func=None) -> Env:
+        from dvc.env import DVC_ROOT
+
+        env: Env = {}
+        if self.repo:
+            env.update({DVC_ROOT: self.repo.root_dir})
+
+        for out in self.outs:
+            current = self._read_env(out, checkpoint_func=checkpoint_func)
+            if any(
+                env.get(key) != current.get(key)
+                for key in set(env.keys()).intersection(current.keys())
+            ):
+                raise DvcException("Conflicting values for env variable")
+            env.update(current)
+        return env
 
     def changed_deps(self):
         if self.frozen:
             return False
 
-        if self.is_callback:
-            logger.debug(
-                '%s is a "callback" stage '
-                "(has a command and no dependencies) and thus always "
-                "considered as changed.",
-                self,
-            )
-            return True
-
-        if self.always_changed:
+        if self.is_callback or self.always_changed or self.is_checkpoint:
             return True
 
         return self._changed_deps()
 
+    @rwlocked(read=["deps"])
     def _changed_deps(self):
         for dep in self.deps:
             status = dep.status()
@@ -241,6 +329,7 @@ class Stage(params.StageParams):
                 return True
         return False
 
+    @rwlocked(read=["outs"])
     def changed_outs(self):
         for out in self.outs:
             status = out.status()
@@ -278,7 +367,7 @@ class Stage(params.StageParams):
     def remove_outs(self, ignore_remove=False, force=False):
         """Used mainly for `dvc remove --outs` and :func:`Stage.reproduce`."""
         for out in self.outs:
-            if out.persist and not force:
+            if (out.persist or out.checkpoint or out.live) and not force:
                 out.unprotect()
                 continue
 
@@ -302,6 +391,19 @@ class Stage(params.StageParams):
             self.ignore_remove_outs()
         if purge:
             self.dvcfile.remove_stage(self)
+
+    def transfer(
+        self,
+        source: str,
+        odb: "ObjectDB" = None,
+        to_remote: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        assert len(self.outs) == 1
+        (out,) = self.outs
+        out.transfer(source, odb=odb, jobs=kwargs.get("jobs"))
+        if not to_remote:
+            out.checkout()
 
     @rwlocked(read=["deps"], write=["outs"])
     def reproduce(self, interactive=False, **kwargs):
@@ -328,45 +430,15 @@ class Stage(params.StageParams):
 
         return self
 
-    def update(self, rev=None):
+    def update(self, rev=None, to_remote=False, remote=None, jobs=None):
         if not (self.is_repo_import or self.is_import):
             raise StageUpdateError(self.relpath)
-        update_import(self, rev=rev)
-
-    @property
-    def can_be_skipped(self):
-        return (
-            self.is_cached and not self.is_callback and not self.always_changed
+        update_import(
+            self, rev=rev, to_remote=to_remote, remote=remote, jobs=jobs
         )
 
     def reload(self):
         return self.dvcfile.stage
-
-    @property
-    def is_cached(self):
-        """Checks if this stage has been already ran and stored"""
-        old = self.reload()
-        if old.changed_outs():
-            return False
-
-        # NOTE: need to save checksums for deps in order to compare them
-        # with what is written in the old stage.
-        self.save_deps()
-        if not stage_dump_eq(Stage, old.dumpd(), self.dumpd()):
-            return False
-
-        # NOTE: committing to prevent potential data duplication. For example
-        #
-        #    $ dvc config cache.type hardlink
-        #    $ echo foo > foo
-        #    $ dvc add foo
-        #    $ rm -f foo
-        #    $ echo foo > foo
-        #    $ dvc add foo # should replace foo with a link to cache
-        #
-        old.commit()
-
-        return True
 
     def dumpd(self):
         return get_dump(self)
@@ -380,20 +452,32 @@ class Stage(params.StageParams):
         logger.debug(f"Computed {self} md5: '{m}'")
         return m
 
-    def save(self):
-        self.save_deps()
-        self.save_outs()
+    def save(self, allow_missing=False):
+        self.save_deps(allow_missing=allow_missing)
+        self.save_outs(allow_missing=allow_missing)
         self.md5 = self.compute_md5()
 
         self.repo.stage_cache.save(self)
 
-    def save_deps(self):
-        for dep in self.deps:
-            dep.save()
+    def save_deps(self, allow_missing=False):
+        from dvc.dependency.base import DependencyDoesNotExistError
 
-    def save_outs(self):
+        for dep in self.deps:
+            try:
+                dep.save()
+            except DependencyDoesNotExistError:
+                if not allow_missing:
+                    raise
+
+    def save_outs(self, allow_missing=False):
+        from dvc.output import OutputDoesNotExistError
+
         for out in self.outs:
-            out.save()
+            try:
+                out.save()
+            except OutputDoesNotExistError:
+                if not (allow_missing or out.checkpoint):
+                    raise
 
     def ignore_outs(self):
         for out in self.outs:
@@ -416,43 +500,80 @@ class Stage(params.StageParams):
         )
 
     @rwlocked(write=["outs"])
-    def commit(self):
-        for out in self.outs:
-            out.commit()
+    def commit(self, allow_missing=False, filter_info=None):
+        from dvc.output import OutputDoesNotExistError
 
-    @rwlocked(read=["deps"], write=["outs"])
-    def run(self, dry=False, no_commit=False, force=False, **kwargs):
+        link_failures = []
+        for out in self.filter_outs(filter_info):
+            try:
+                out.commit(filter_info=filter_info)
+            except OutputDoesNotExistError:
+                if not (allow_missing or out.checkpoint):
+                    raise
+            except CacheLinkError:
+                link_failures.append(out.fs_path)
+        if link_failures:
+            raise CacheLinkError(link_failures)
+
+    @rwlocked(read=["deps", "outs"])
+    def run(
+        self,
+        dry=False,
+        no_commit=False,
+        force=False,
+        allow_missing=False,
+        **kwargs,
+    ):
         if (self.cmd or self.is_import) and not self.frozen and not dry:
             self.remove_outs(ignore_remove=False, force=False)
 
         if not self.frozen and self.is_import:
-            sync_import(self, dry, force)
+            jobs = kwargs.get("jobs", None)
+            self._sync_import(dry, force, jobs)
         elif not self.frozen and self.cmd:
-            run_stage(self, dry, force, **kwargs)
+            self._run_stage(dry, force, **kwargs)
         else:
             args = (
                 ("outputs", "frozen ") if self.frozen else ("data sources", "")
             )
             logger.info("Verifying %s in %s%s", *args, self)
             if not dry:
-                check_missing_outputs(self)
+                self._check_missing_outputs()
 
         if not dry:
-            self.save()
+            if kwargs.get("checkpoint_func", None):
+                allow_missing = True
+            self.save(allow_missing=allow_missing)
             if not no_commit:
-                self.commit()
+                self.commit(allow_missing=allow_missing)
 
-    def filter_outs(self, path_info):
+    @rwlocked(read=["deps"], write=["outs"])
+    def _run_stage(self, dry, force, **kwargs):
+        return run_stage(self, dry, force, **kwargs)
+
+    @rwlocked(read=["deps"], write=["outs"])
+    def _sync_import(self, dry, force, jobs):
+        sync_import(self, dry, force, jobs)
+
+    @rwlocked(read=["outs"])
+    def _check_missing_outputs(self):
+        check_missing_outputs(self)
+
+    def filter_outs(self, fs_path):
         def _func(o):
-            return path_info.isin_or_eq(o.path_info)
+            return o.fs.path.isin_or_eq(fs_path, o.fs_path)
 
-        return filter(_func, self.outs) if path_info else self.outs
+        return filter(_func, self.outs) if fs_path else self.outs
 
     @rwlocked(write=["outs"])
-    def checkout(self, **kwargs):
+    def checkout(self, allow_missing=False, **kwargs):
         stats = defaultdict(list)
         for out in self.filter_outs(kwargs.get("filter_info")):
-            key, outs = self._checkout(out, **kwargs)
+            key, outs = self._checkout(
+                out,
+                allow_missing=allow_missing or self.is_checkpoint,
+                **kwargs,
+            )
             if key:
                 stats[key].extend(outs)
         return stats
@@ -464,7 +585,7 @@ class Stage(params.StageParams):
             added, modified = result or (None, None)
             if not (added or modified):
                 return None, []
-            return "modified" if modified else "added", [out.path_info]
+            return "modified" if modified else "added", [str(out)]
         except CheckoutError as exc:
             return "failed", exc.target_infos
 
@@ -501,7 +622,7 @@ class Stage(params.StageParams):
             ret.append({"changed outs": outs_status})
 
     def _status_always_changed(self, ret):
-        if self.is_callback or self.always_changed:
+        if self.is_callback or self.always_changed or self.is_checkpoint:
             ret.append("always changed")
 
     def _status_stage(self, ret):
@@ -530,14 +651,15 @@ class Stage(params.StageParams):
             for out in self.filter_outs(filter_info)
         )
 
-    def get_used_cache(self, *args, **kwargs):
-        from dvc.cache import NamedCache
-
-        cache = NamedCache()
+    def get_used_objs(
+        self, *args, **kwargs
+    ) -> Dict[Optional["ObjectDB"], Set["HashInfo"]]:
+        """Return set of object IDs used by this stage."""
+        used_objs = defaultdict(set)
         for out in self.filter_outs(kwargs.get("filter_info")):
-            cache.update(out.get_used_cache(*args, **kwargs))
-
-        return cache
+            for odb, objs in out.get_used_objs(*args, **kwargs).items():
+                used_objs[odb].update(objs)
+        return used_objs
 
     @staticmethod
     def _check_can_merge(stage, ancestor_out=None):
@@ -546,13 +668,13 @@ class Stage(params.StageParams):
 
         if not stage.is_data_source or stage.deps or len(stage.outs) > 1:
             raise MergeError(
-                "unable to auto-merge DVC-files that weren't "
+                "unable to auto-merge DVC files that weren't "
                 "created by `dvc add`"
             )
 
         if ancestor_out and not stage.outs:
             raise MergeError(
-                "unable to auto-merge DVC-files with deleted outputs"
+                "unable to auto-merge DVC files with deleted outputs"
             )
 
     def merge(self, ancestor, other):
@@ -577,12 +699,16 @@ class Stage(params.StageParams):
 
         self.outs[0].merge(ancestor_out, other.outs[0])
 
+    def dump(self, **kwargs):
+        self.dvcfile.dump(self, **kwargs)
+
 
 class PipelineStage(Stage):
     def __init__(self, *args, name=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.name = name
         self.cmd_changed = False
+        self.tracked_vars = {}
 
     def __eq__(self, other):
         return super().__eq__(other) and self.name == other.name
@@ -600,10 +726,6 @@ class PipelineStage(Stage):
 
     def reload(self):
         return self.dvcfile.stages[self.name]
-
-    @property
-    def is_cached(self):
-        return self.name in self.dvcfile.stages and super().is_cached
 
     def _status_stage(self, ret):
         if self.cmd_changed:

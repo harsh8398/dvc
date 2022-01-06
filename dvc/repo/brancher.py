@@ -1,6 +1,6 @@
-from funcy import group_by
+from functools import partial
 
-from dvc.tree.local import LocalTree
+from funcy import group_by
 
 
 def brancher(  # noqa: E302
@@ -9,6 +9,7 @@ def brancher(  # noqa: E302
     all_branches=False,
     all_tags=False,
     all_commits=False,
+    all_experiments=False,
     sha_only=False,
 ):
     """Generator that iterates over specified revisions.
@@ -21,21 +22,23 @@ def brancher(  # noqa: E302
         sha_only (bool): only return git SHA for a revision.
 
     Yields:
-        str: the display name for the currently selected tree, it could be:
+        str: the display name for the currently selected fs, it could be:
             - a git revision identifier
             - empty string it there is no branches to iterate over
             - "workspace" if there are uncommitted changes in the SCM repo
     """
-    if not any([revs, all_branches, all_tags, all_commits]):
+    if not any([revs, all_branches, all_tags, all_commits, all_experiments]):
         yield ""
         return
 
-    saved_tree = self.tree
+    from dvc.fs.local import LocalFileSystem
+
+    saved_fs = self.fs
     revs = revs.copy() if revs else []
 
     scm = self.scm
 
-    self.tree = LocalTree(self, {"url": self.root_dir}, use_dvcignore=True)
+    self.fs = LocalFileSystem(url=self.root_dir)
     yield "workspace"
 
     if revs and "workspace" in revs:
@@ -50,18 +53,25 @@ def brancher(  # noqa: E302
         if all_tags:
             revs.extend(scm.list_tags())
 
+    if all_experiments:
+        from dvc.repo.experiments.utils import exp_commits
+
+        revs.extend(exp_commits(scm))
+
     try:
         if revs:
-            for sha, names in group_by(scm.resolve_rev, revs).items():
-                self.tree = scm.get_tree(
-                    sha, use_dvcignore=True, dvcignore_root=self.root_dir
-                )
+            from dvc.fs.git import GitFileSystem
+            from dvc.scm import resolve_rev
+
+            rev_resolver = partial(resolve_rev, scm)
+            for sha, names in group_by(rev_resolver, revs).items():
+                self.fs = GitFileSystem(scm=scm, rev=sha)
                 # ignore revs that don't contain repo root
                 # (i.e. revs from before a subdir=True repo was init'ed)
-                if self.tree.exists(self.root_dir):
+                if self.fs.exists(self.root_dir):
                     if sha_only:
                         yield sha
                     else:
                         yield ", ".join(names)
     finally:
-        self.tree = saved_tree
+        self.fs = saved_fs

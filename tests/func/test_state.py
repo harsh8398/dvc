@@ -1,8 +1,8 @@
 import os
+import re
 
-import mock
-
-from dvc.path_info import PathInfo
+from dvc.hash_info import HashInfo
+from dvc.repo import Repo
 from dvc.state import State
 from dvc.utils import file_md5
 
@@ -10,27 +10,22 @@ from dvc.utils import file_md5
 def test_state(tmp_dir, dvc):
     tmp_dir.gen("foo", "foo content")
     path = tmp_dir / "foo"
-    path_info = PathInfo(path)
-    md5 = file_md5(path)[0]
+    hash_info = HashInfo("md5", file_md5(path, dvc.fs))
 
-    state = State(dvc.cache.local)
+    state = State(dvc.root_dir, dvc.tmp_dir, dvc.dvcignore)
 
-    with state:
-        state.save(path_info, md5)
-        entry_md5 = state.get(path_info)
-        assert entry_md5 == md5
+    state.save(path, dvc.fs, hash_info)
+    assert state.get(path, dvc.fs)[1] == hash_info
 
-        path.unlink()
-        path.write_text("1")
+    path.unlink()
+    path.write_text("1")
 
-        entry_md5 = state.get(path_info)
-        assert entry_md5 is None
+    assert state.get(path, dvc.fs) == (None, None)
 
-        md5 = file_md5(path)[0]
-        state.save(path_info, md5)
+    hash_info = HashInfo("md5", file_md5(path, dvc.fs))
+    state.save(path, dvc.fs, hash_info)
 
-        entry_md5 = state.get(path_info)
-        assert entry_md5 == md5
+    assert state.get(path, dvc.fs)[1] == hash_info
 
 
 def test_state_overflow(tmp_dir, dvc):
@@ -53,51 +48,46 @@ def mock_get_inode(inode):
     return get_inode_mocked
 
 
-@mock.patch("dvc.state.get_inode", autospec=True)
-def test_get_state_record_for_inode(get_inode_mock, tmp_dir, dvc):
-    tmp_dir.gen("foo", "foo content")
-
-    state = State(dvc.cache.local)
-    inode = state.MAX_INT + 2
-    assert inode != state._to_sqlite(inode)
-
-    foo = tmp_dir / "foo"
-    md5 = file_md5(foo)[0]
-    get_inode_mock.side_effect = mock_get_inode(inode)
-
-    with state:
-        state.save(PathInfo(foo), md5)
-        ret = state.get_state_record_for_inode(inode)
-        assert ret is not None
-
-
 def test_remove_links(tmp_dir, dvc):
     tmp_dir.dvc_gen({"foo": "foo_content", "bar": "bar_content"})
 
-    with dvc.state:
-        cmd_count_links = "SELECT count(*) FROM {}".format(
-            State.LINK_STATE_TABLE
-        )
-        result = dvc.state._execute(cmd_count_links).fetchone()[0]
-        assert result == 2
+    assert len(dvc.state.links) == 2
 
-        dvc.state.remove_links(["foo", "bar"])
+    dvc.state.remove_links(["foo", "bar"], dvc.fs)
 
-        result = dvc.state._execute(cmd_count_links).fetchone()[0]
-        assert result == 0
+    assert len(dvc.state.links) == 0
 
 
 def test_get_unused_links(tmp_dir, dvc):
     tmp_dir.dvc_gen({"foo": "foo_content", "bar": "bar_content"})
 
-    with dvc.state:
-        links = [os.path.join(dvc.root_dir, link) for link in ["foo", "bar"]]
-        assert set(dvc.state.get_unused_links([])) == {"foo", "bar"}
-        assert set(dvc.state.get_unused_links(links[:1])) == {"bar"}
-        assert set(dvc.state.get_unused_links(links)) == set()
-        assert set(
+    links = [os.path.join(dvc.root_dir, link) for link in ["foo", "bar"]]
+    assert set(dvc.state.get_unused_links([], dvc.fs)) == {"foo", "bar"}
+    assert set(dvc.state.get_unused_links(links[:1], dvc.fs)) == {"bar"}
+    assert set(dvc.state.get_unused_links(links, dvc.fs)) == set()
+    assert (
+        set(
             dvc.state.get_unused_links(
-                used=links[:1]
-                + [os.path.join(dvc.root_dir, "not-existing-file")]
+                (
+                    links[:1]
+                    + [os.path.join(dvc.root_dir, "not-existing-file")]
+                ),
+                dvc.fs,
             )
-        ) == {"bar"}
+        )
+        == {"bar"}
+    )
+
+
+def test_state_dir_config(make_tmp_dir, dvc):
+    assert dvc.state.tmp_dir == dvc.tmp_dir
+
+    index_dir = str(make_tmp_dir("tmp_index"))
+    repo = Repo(config={"state": {"dir": index_dir}})
+    assert os.path.dirname(repo.state.tmp_dir) == os.path.join(
+        index_dir, ".dvc"
+    )
+    assert re.match(
+        r"^test_state_dir_config0-([0-9a-f]+)$",
+        os.path.basename(repo.state.tmp_dir),
+    )

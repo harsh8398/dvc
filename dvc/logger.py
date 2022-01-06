@@ -23,14 +23,19 @@ def addLoggingLevel(levelName, levelNum, methodName=None):
     Adds a new logging level to the `logging` module and the
     currently configured logging class.
 
+    Uses the existing numeric levelNum if already defined.
+
     Based on https://stackoverflow.com/questions/2183233
     """
     if methodName is None:
         methodName = levelName.lower()
 
-    assert not hasattr(logging, levelName)
-    assert not hasattr(logging, methodName)
-    assert not hasattr(logging.getLoggerClass(), methodName)
+    # If the level name is already defined as a top-level `logging`
+    # constant, then adopt the existing numeric level.
+    if hasattr(logging, levelName):
+        existingLevelNum = getattr(logging, levelName)
+        assert isinstance(existingLevelNum, int)
+        levelNum = existingLevelNum
 
     def logForLevel(self, message, *args, **kwargs):
         if self.isEnabledFor(levelNum):
@@ -40,15 +45,24 @@ def addLoggingLevel(levelName, levelNum, methodName=None):
     def logToRoot(message, *args, **kwargs):
         logging.log(levelNum, message, *args, **kwargs)
 
-    logging.addLevelName(levelNum, levelName)
-    setattr(logging, levelName, levelNum)
-    setattr(logging.getLoggerClass(), methodName, logForLevel)
-    setattr(logging, methodName, logToRoot)
+    # getLevelName resolves the numeric log level if already defined,
+    # otherwise returns a string
+    if not isinstance(logging.getLevelName(levelName), int):
+        logging.addLevelName(levelNum, levelName)
+
+    if not hasattr(logging, levelName):
+        setattr(logging, levelName, levelNum)
+
+    if not hasattr(logging.getLoggerClass(), methodName):
+        setattr(logging.getLoggerClass(), methodName, logForLevel)
+
+    if not hasattr(logging, methodName):
+        setattr(logging, methodName, logToRoot)
 
 
 class LoggingException(Exception):
     def __init__(self, record):
-        msg = "failed to log {}".format(str(record))
+        msg = f"failed to log {str(record)}"
         super().__init__(msg)
 
 
@@ -128,9 +142,22 @@ class LoggerHandler(logging.StreamHandler):
         super().handleError(record)
         raise LoggingException(record)
 
+    def emit_pretty_exception(self, exc, verbose: bool = False):
+        return exc.__pretty_exc__(verbose=verbose)
+
     def emit(self, record):
         """Write to Tqdm's stream so as to not break progress-bars"""
         try:
+            if record.exc_info:
+                _, exc, *_ = record.exc_info
+                if hasattr(exc, "__pretty_exc__"):
+                    try:
+                        self.emit_pretty_exception(exc, verbose=_is_verbose())
+                        if not _is_verbose():
+                            return
+                    except Exception:  # noqa, pylint: disable=broad-except
+                        pass
+
             msg = self.format(record)
             Tqdm.write(
                 msg, file=self.stream, end=getattr(self, "terminator", "\n")
@@ -174,14 +201,25 @@ def _stack_trace(exc_info):
 
 def disable_other_loggers():
     logging.captureWarnings(True)
-    root = logging.root
-    for (logger_name, logger) in root.manager.loggerDict.items():
+    loggerDict = logging.root.manager.loggerDict  # pylint: disable=no-member
+    for logger_name, logger in loggerDict.items():
         if logger_name != "dvc" and not logger_name.startswith("dvc."):
             logger.disabled = True
 
 
 def setup(level=logging.INFO):
     colorama.init()
+
+    if level >= logging.DEBUG:
+        # Unclosed session errors for asyncio/aiohttp are only available
+        # on the tracing mode for extensive debug purposes. They are really
+        # noisy, and this is potentially somewhere in the client library
+        # not managing their own session. Even though it is the best practice
+        # for them to do so, we can be assured that these errors raised when
+        # the object is getting deallocated, so no need to take any extensive
+        # action.
+        logging.getLogger("asyncio").setLevel(logging.CRITICAL)
+        logging.getLogger("aiohttp").setLevel(logging.CRITICAL)
 
     addLoggingLevel("TRACE", logging.DEBUG - 5)
     logging.config.dictConfig(
@@ -231,7 +269,7 @@ def setup(level=logging.INFO):
                         "console_trace",
                         "console_errors",
                     ],
-                },
+                }
             },
             "disable_existing_loggers": False,
         }

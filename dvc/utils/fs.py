@@ -4,60 +4,61 @@ import os
 import shutil
 import stat
 import sys
-
-import nanotime
-from shortuuid import uuid
+from contextlib import contextmanager, suppress
+from typing import TYPE_CHECKING
 
 from dvc.exceptions import DvcException
 from dvc.system import System
 from dvc.utils import dict_md5
 
+if TYPE_CHECKING:
+    from dvc.types import StrPath
+
 logger = logging.getLogger(__name__)
 
 LOCAL_CHUNK_SIZE = 2 ** 20  # 1 MB
 
-
-def fs_copy(src, dst):
-    if os.path.isdir(src):
-        shutil.copytree(src, dst)
-    else:
-        shutil.copy2(src, dst)
+umask = os.umask(0)
+os.umask(umask)
 
 
 def get_inode(path):
     inode = System.inode(path)
-    logger.debug("Path '%s' inode '%d'", path, inode)
+    logger.trace("Path '%s' inode '%d'", path, inode)
     return inode
 
 
-def get_mtime_and_size(path, tree):
+def get_mtime_and_size(path, fs, dvcignore=None):
+    import nanotime
 
-    if tree.isdir(path):
+    if fs.isdir(path):
         size = 0
         files_mtimes = {}
-        for file_path in tree.walk_files(path):
+        if dvcignore:
+            walk_iterator = dvcignore.find(fs, path)
+        else:
+            walk_iterator = fs.find(path)
+        for file_path in walk_iterator:
             try:
-                stats = tree.stat(file_path)
+                stats = fs.info(file_path)
             except OSError as exc:
                 # NOTE: broken symlink case.
                 if exc.errno != errno.ENOENT:
                     raise
                 continue
-            size += stats.st_size
-            files_mtimes[os.fspath(file_path)] = stats.st_mtime
+            size += stats["size"]
+            files_mtimes[file_path] = stats["mtime"]
 
         # We track file changes and moves, which cannot be detected with simply
         # max(mtime(f) for f in non_ignored_files)
         mtime = dict_md5(files_mtimes)
     else:
-        base_stat = tree.stat(path)
-        size = base_stat.st_size
-        mtime = base_stat.st_mtime
+        base_stat = fs.info(path)
+        size = base_stat["size"]
+        mtime = base_stat["mtime"]
         mtime = int(nanotime.timestamp(mtime))
 
-    # State of files handled by dvc is stored in db as TEXT.
-    # We cast results to string for later comparisons with stored values.
-    return str(mtime), str(size)
+    return str(mtime), size
 
 
 class BasePathNotInCheckedPathException(DvcException):
@@ -68,9 +69,9 @@ class BasePathNotInCheckedPathException(DvcException):
         super().__init__(msg)
 
 
-def contains_symlink_up_to(path, base_path):
-    base_path = os.fspath(base_path)
-    path = os.fspath(path)
+def contains_symlink_up_to(path: "StrPath", base_path: "StrPath"):
+    base_path = os.path.normcase(os.fspath(base_path))
+    path = os.path.normcase(os.fspath(path))
 
     if base_path not in path:
         raise BasePathNotInCheckedPathException(path, base_path)
@@ -84,25 +85,23 @@ def contains_symlink_up_to(path, base_path):
     return contains_symlink_up_to(os.path.dirname(path), base_path)
 
 
-def move(src, dst, mode=None):
+def move(src, dst):
     """Atomically move src to dst and chmod it with mode.
 
     Moving is performed in two stages to make the whole operation atomic in
     case src and dst are on different filesystems and actual physical copying
     of data is happening.
     """
+    from shortuuid import uuid
 
     dst = os.path.abspath(dst)
     tmp = f"{dst}.{uuid()}"
 
     if os.path.islink(src):
         shutil.copy(src, tmp)
-        os.unlink(src)
+        _unlink(src, _chmod)
     else:
         shutil.move(src, tmp)
-
-    if mode is not None:
-        os.chmod(tmp, mode)
 
     shutil.move(tmp, dst)
 
@@ -141,11 +140,11 @@ def remove(path):
             raise
 
 
-def path_isin(child, parent):
+def path_isin(child: "StrPath", parent: "StrPath") -> bool:
     """Check if given `child` path is inside `parent`."""
 
-    def normalize_path(path):
-        return os.path.normpath(path)
+    def normalize_path(path) -> str:
+        return os.path.normcase(os.path.normpath(path))
 
     parent = os.path.join(normalize_path(parent), "")
     child = normalize_path(child)
@@ -157,43 +156,69 @@ def makedirs(path, exist_ok=False, mode=None):
         os.makedirs(path, exist_ok=exist_ok)
         return
 
-    # utilize umask to set proper permissions since Python 3.7 the `mode`
-    # `makedirs` argument no longer affects the file permission bits of
-    # newly-created intermediate-level directories.
-    umask = os.umask(0o777 - mode)
+    # Modified version of os.makedirs() with support for extended mode
+    # (e.g. S_ISGID)
+    head, tail = os.path.split(path)
+    if not tail:
+        head, tail = os.path.split(head)
+    if head and tail and not os.path.exists(head):
+        try:
+            makedirs(head, exist_ok=exist_ok, mode=mode)
+        except FileExistsError:
+            # Defeats race condition when another thread created the path
+            pass
+        cdir = os.curdir
+        if isinstance(tail, bytes):
+            cdir = bytes(os.curdir, "ASCII")
+        if tail == cdir:  # xxx/newdir/. exists if xxx/newdir exists
+            return
     try:
-        os.makedirs(path, exist_ok=exist_ok)
-    finally:
-        os.umask(umask)
+        os.mkdir(path, mode)
+    except OSError:
+        # Cannot rely on checking for EEXIST, since the operating system
+        # could give priority to other errors like EACCES or EROFS
+        if not exist_ok or not os.path.isdir(path):
+            raise
+
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        logger.trace("failed to chmod '%o' '%s'", mode, path, exc_info=True)
 
 
-def copyfile(src, dest, no_progress_bar=False, name=None):
+def copyfile(src, dest, callback=None, no_progress_bar=False, name=None):
     """Copy file with progress bar"""
-    from dvc.progress import Tqdm
-
     name = name if name else os.path.basename(dest)
     total = os.stat(src).st_size
 
     if os.path.isdir(dest):
         dest = os.path.join(dest, os.path.basename(src))
 
+    if callback:
+        callback.set_size(total)
+
     try:
         System.reflink(src, dest)
-    except DvcException:
+    except OSError:
+        from dvc.progress import tdqm_or_callback_wrapped
+
         with open(src, "rb") as fsrc, open(dest, "wb+") as fdest:
-            with Tqdm.wrapattr(
+            with tdqm_or_callback_wrapped(
                 fdest,
                 "write",
-                desc=name,
+                total,
+                callback=callback,
                 disable=no_progress_bar,
-                total=total,
-                bytes=True,
-            ) as fdest_wrapped:
+                desc=name,
+            ) as wrapped:
                 while True:
                     buf = fsrc.read(LOCAL_CHUNK_SIZE)
                     if not buf:
                         break
-                    fdest_wrapped.write(buf)
+                    wrapped.write(buf)
+
+    if callback:
+        callback.absolute_update(total)
 
 
 def copy_fobj_to_file(fsrc, dest):
@@ -206,3 +231,21 @@ def walk_files(directory):
     for root, _, files in os.walk(directory):
         for f in files:
             yield os.path.join(root, f)
+
+
+@contextmanager
+def as_atomic(fs, to_info):
+    from dvc.utils import tmp_fname
+
+    tmp_info = fs.path.join(fs.path.parent(to_info), tmp_fname())
+    try:
+        yield tmp_info
+    except BaseException:
+        # Handle stuff like KeyboardInterrupt
+        # as well as other errors that might
+        # arise during file transfer.
+        with suppress(FileNotFoundError):
+            fs.remove(tmp_info)
+        raise
+    else:
+        fs.move(tmp_info, to_info)

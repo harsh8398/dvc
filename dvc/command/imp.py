@@ -17,6 +17,9 @@ class CmdImport(CmdBase):
                 out=self.args.out,
                 fname=self.args.file,
                 rev=self.args.rev,
+                no_exec=self.args.no_exec,
+                desc=self.args.desc,
+                jobs=self.args.jobs,
             )
         except DvcException:
             logger.exception(
@@ -45,7 +48,7 @@ def add_parser(subparsers, parent_parser):
         "url", help="Location of DVC or Git repository to download from"
     )
     import_parser.add_argument(
-        "path", help="Path to a file or directory within the repository",
+        "path", help="Path to a file or directory within the repository"
     ).complete = completion.FILE
     import_parser.add_argument(
         "-o",
@@ -62,7 +65,33 @@ def add_parser(subparsers, parent_parser):
     )
     import_parser.add_argument(
         "--file",
-        help="Specify name of the DVC-file this command will generate.",
+        help="Specify name of the .dvc file this command will generate.",
         metavar="<filename>",
+    )
+    import_parser.add_argument(
+        "--no-exec",
+        action="store_true",
+        default=False,
+        help="Only create .dvc file without actually downloading it.",
+    )
+    import_parser.add_argument(
+        "--desc",
+        type=str,
+        metavar="<text>",
+        help=(
+            "User description of the data (optional). "
+            "This doesn't affect any DVC operations."
+        ),
+    )
+    import_parser.add_argument(
+        "-j",
+        "--jobs",
+        type=int,
+        help=(
+            "Number of jobs to run simultaneously. "
+            "The default value is 4 * cpu_count(). "
+            "For SSH remotes, the default is 4. "
+        ),
+        metavar="<number>",
     )
     import_parser.set_defaults(func=CmdImport)

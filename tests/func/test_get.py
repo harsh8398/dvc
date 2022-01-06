@@ -3,15 +3,13 @@ import os
 
 import pytest
 
-from dvc.cache import Cache
-from dvc.exceptions import PathMissingError
-from dvc.external_repo import IsADVCRepoError
 from dvc.main import main
+from dvc.objects.db import ODBManager
 from dvc.repo import Repo
 from dvc.repo.get import GetDVCFileError
 from dvc.system import System
 from dvc.utils.fs import makedirs
-from tests.unit.tree.test_repo import make_subrepo
+from tests.unit.fs.test_repo import make_subrepo
 
 
 def test_get_repo_file(tmp_dir, erepo_dir):
@@ -19,6 +17,22 @@ def test_get_repo_file(tmp_dir, erepo_dir):
         erepo_dir.dvc_gen("file", "contents", commit="create file")
 
     Repo.get(os.fspath(erepo_dir), "file", "file_imported")
+
+    assert os.path.isfile("file_imported")
+    assert (tmp_dir / "file_imported").read_text() == "contents"
+
+
+def test_get_repo_file_replace_without_confirmation(tmp_dir, erepo_dir):
+    with erepo_dir.chdir():
+        erepo_dir.dvc_gen("file", "contents", commit="create file")
+        erepo_dir.dvc_gen(
+            "file2", "something different", commit="create file2"
+        )
+
+    Repo.get(os.fspath(erepo_dir), "file", "file_imported")
+    # getting another file with a name that already exists in Repo.
+    with pytest.raises(FileExistsError):
+        Repo.get(os.fspath(erepo_dir), "file2", "file_imported")
 
     assert os.path.isfile("file_imported")
     assert (tmp_dir / "file_imported").read_text() == "contents"
@@ -67,7 +81,7 @@ def test_cache_type_is_properly_overridden(tmp_dir, erepo_dir):
     with erepo_dir.chdir():
         with erepo_dir.dvc.config.edit() as conf:
             conf["cache"]["type"] = "symlink"
-        erepo_dir.dvc.cache = Cache(erepo_dir.dvc)
+        erepo_dir.dvc.odb = ODBManager(erepo_dir.dvc)
         erepo_dir.scm_add(
             [erepo_dir.dvc.config.files["repo"]], "set cache type to symlinks"
         )
@@ -137,17 +151,17 @@ def test_non_cached_output(tmp_dir, erepo_dir):
 
 # https://github.com/iterative/dvc/pull/2837#discussion_r352123053
 def test_absolute_file_outside_repo(tmp_dir, erepo_dir):
-    with pytest.raises(PathMissingError):
+    with pytest.raises(FileNotFoundError):
         Repo.get(os.fspath(erepo_dir), "/root/")
 
 
 def test_absolute_file_outside_git_repo(tmp_dir, git_dir):
-    with pytest.raises(PathMissingError):
+    with pytest.raises(FileNotFoundError):
         Repo.get(os.fspath(git_dir), "/root/")
 
 
 def test_unknown_path(tmp_dir, erepo_dir):
-    with pytest.raises(PathMissingError):
+    with pytest.raises(FileNotFoundError):
         Repo.get(os.fspath(erepo_dir), "a_non_existing_file")
 
 
@@ -252,7 +266,7 @@ def test_get_pipeline_tracked_outs(
     dvc.scm.commit("add pipeline stage")
 
     with git_dir.chdir():
-        Repo.get("file:///{}".format(os.fspath(tmp_dir)), "bar", out="baz")
+        Repo.get(f"file:///{os.fspath(tmp_dir)}", "bar", out="baz")
         assert (git_dir / "baz").read_text() == "foo"
 
 
@@ -295,17 +309,23 @@ def test_granular_get_from_subrepos(tmp_dir, erepo_dir):
     assert (tmp_dir / "out").read_text() == "bar"
 
 
-def test_try_to_get_complete_repo(tmp_dir, dvc, erepo_dir):
+def test_get_complete_repo(tmp_dir, dvc, erepo_dir):
+    with erepo_dir.chdir():
+        erepo_dir.dvc_gen({"foo": "foo"}, commit="add foo")
+
     subrepo = erepo_dir / "subrepo"
     make_subrepo(subrepo, erepo_dir.scm)
     with subrepo.chdir():
         subrepo.dvc_gen({"dir": {"bar": "bar"}}, commit="files in subrepo")
 
-    expected_message = "Cannot fetch a complete DVC repository"
-    with pytest.raises(IsADVCRepoError) as exc_info:
-        Repo.get(os.fspath(erepo_dir), "subrepo", out="out")
-    assert f"{expected_message} 'subrepo'" == str(exc_info.value)
+    Repo.get(os.fspath(erepo_dir), "subrepo", out="out_sub")
+    assert (tmp_dir / "out_sub").read_text() == {
+        ".gitignore": "/dir\n",
+        "dir": {"bar": "bar"},
+    }
 
-    with pytest.raises(IsADVCRepoError) as exc_info:
-        Repo.get(os.fspath(erepo_dir), ".", out="out")
-    assert expected_message == str(exc_info.value)
+    Repo.get(os.fspath(erepo_dir), ".", out="out")
+    assert (tmp_dir / "out").read_text() == {
+        ".gitignore": "/foo\n",
+        "foo": "foo",
+    }

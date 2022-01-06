@@ -1,8 +1,8 @@
 #define MyAppName "DVC (Data Version Control)"
-#define MyAppVersion ReadIni(".\scripts\innosetup\config.ini", "Version", "version", "unknown")
+#define MyAppVersion ReadIni(SourcePath + "\config.ini", "Version", "version", "unknown")
 #define MyAppPublisher "Dmitry Petrov"
-#define MyAppURL "https://dataversioncontrol.com/"
-#define MyAppDir "..\..\dist\dvc"
+#define MyAppURL "https://dvc.org"
+#define MyAppDir SourcePath + "\build\dvc"
 
 [Setup]
 AppId={{8258CE8A-110E-4E0D-AE60-FEE00B15F041}
@@ -19,7 +19,7 @@ LicenseFile=..\..\LICENSE
 OutputBaseFilename=dvc-{#MyAppVersion}
 Compression=lzma2/max
 SolidCompression=yes
-OutputDir=..\..\
+OutputDir=.
 ChangesEnvironment=yes
 SetupIconFile=dvc.ico
 WizardSmallImageFile=dvc_up.bmp
@@ -34,7 +34,7 @@ Source: "{#MyAppDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs c
 
 [Tasks]
 Name: modifypath; Description: Adds dvc's application directory to environmental path; Flags: checkablealone;
-Name: modifypath\system; Description: Adds dvc's application directory to enviromental path for all users;
+Name: modifypath\system; Description: Adds dvc's application directory to environmental path for all users;
 Name: addsymlinkpermissions; Description: Add permission for creating symbolic links; Flags: checkablealone;
 Name: addsymlinkpermissions\system; Description: Add permissions for creating symbolic links for all users;
 

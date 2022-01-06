@@ -1,15 +1,43 @@
+import csv
+import io
 import logging
 import os
+from collections import OrderedDict
+from functools import partial
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    Generator,
+    List,
+    Optional,
+)
 
 from funcy import cached_property, first, project
 
-from dvc.exceptions import DvcException, NoPlotsError
-from dvc.path_info import PathInfo
-from dvc.schema import PLOT_PROPS
-from dvc.tree.repo import RepoTree
-from dvc.utils import relpath
+from dvc.exceptions import DvcException
+from dvc.utils import (
+    error_handler,
+    errored_revisions,
+    onerror_collect,
+    relpath,
+)
+from dvc.utils.serialize import LOADERS
+
+if TYPE_CHECKING:
+    from dvc.output import Output
+    from dvc.repo import Repo
 
 logger = logging.getLogger(__name__)
+
+
+class PlotMetricTypeError(DvcException):
+    def __init__(self, file):
+        super().__init__(
+            "'{}' - file type error\n"
+            "Only JSON, YAML, CSV and TSV formats are supported.".format(file)
+        )
 
 
 class NotAPlotError(DvcException):
@@ -24,77 +52,131 @@ class PropsNotFoundError(DvcException):
     pass
 
 
+@error_handler
+def _unpack_dir_files(fs, path, **kwargs):
+    return list(fs.find(path))
+
+
 class Plots:
     def __init__(self, repo):
         self.repo = repo
 
-    def collect(self, targets=None, revs=None):
+    def collect(
+        self,
+        targets: List[str] = None,
+        revs: List[str] = None,
+        recursive: bool = False,
+        onerror: Optional[Callable] = None,
+        props: Optional[Dict] = None,
+    ) -> Generator[Dict, None, None]:
         """Collects all props and data for plots.
 
-        Returns a structure like:
+        Generator yielding a structure like:
             {rev: {plots.csv: {
                 props: {x: ..., "header": ..., ...},
-                data: "...data as a string...",
+                data: "unstructured data (as stored for given extension)",
             }}}
-        Data parsing is postponed, since it's affected by props.
         """
-        targets = [targets] if isinstance(targets, str) else targets or []
-        data = {}
+        from dvc.utils.collections import ensure_list
+
+        targets = ensure_list(targets)
         for rev in self.repo.brancher(revs=revs):
             # .brancher() adds unwanted workspace
             if revs is not None and rev not in revs:
                 continue
             rev = rev or "workspace"
+            yield {
+                rev: self._collect_from_revision(
+                    revision=rev,
+                    targets=targets,
+                    recursive=recursive,
+                    onerror=onerror,
+                    props=props,
+                )
+            }
 
-            tree = RepoTree(self.repo)
-            plots = _collect_plots(self.repo, targets, rev)
-            for path_info, props in plots.items():
-                datafile = relpath(path_info, self.repo.root_dir)
-                if rev not in data:
-                    data[rev] = {}
-                data[rev].update({datafile: {"props": props}})
+    @error_handler
+    def _collect_from_revision(
+        self,
+        targets: Optional[List[str]] = None,
+        revision: Optional[str] = None,
+        recursive: bool = False,
+        onerror: Optional[Callable] = None,
+        props: Optional[Dict] = None,
+    ):
+        from dvc.fs.repo import RepoFileSystem
 
-                # Load data from git or dvc cache
-                try:
-                    with tree.open(path_info) as fd:
-                        data[rev][datafile]["data"] = fd.read()
-                except FileNotFoundError:
-                    # This might happen simply because cache is absent
-                    pass
+        fs = RepoFileSystem(self.repo)
+        plots = _collect_plots(self.repo, targets, revision, recursive)
+        res: Dict[str, Any] = {}
+        for fs_path, rev_props in plots.items():
+            if fs.isdir(fs_path):
+                plot_files = []
+                unpacking_res = _unpack_dir_files(fs, fs_path, onerror=onerror)
+                if "data" in unpacking_res:
+                    for pi in unpacking_res.get(  # pylint: disable=E1101
+                        "data"
+                    ):
+                        plot_files.append(
+                            (pi, relpath(pi, self.repo.root_dir))
+                        )
+                else:
+                    res[relpath(fs_path, self.repo.root_dir)] = unpacking_res
+            else:
+                plot_files = [(fs_path, relpath(fs_path, self.repo.root_dir))]
 
-        return data
+            props = props or {}
 
-    @staticmethod
-    def render(data, revs=None, props=None, templates=None):
-        """Renders plots"""
-        props = props or {}
+            for path, repo_path in plot_files:
+                joined_props = {**rev_props, **props}
+                res[repo_path] = {"props": joined_props}
+                res[repo_path].update(
+                    {
+                        "data_source": partial(
+                            parse,
+                            fs,
+                            path,
+                            props=joined_props,
+                            onerror=onerror,
+                        )
+                    }
+                )
+        return res
 
-        # Merge data by plot file and apply overriding props
-        plots = _prepare_plots(data, revs, props)
+    def show(
+        self,
+        targets: List[str] = None,
+        revs=None,
+        props=None,
+        recursive=False,
+        onerror=None,
+    ):
+        if onerror is None:
+            onerror = onerror_collect
 
-        return {
-            datafile: _render(datafile, desc["data"], desc["props"], templates)
-            for datafile, desc in plots.items()
-        }
+        result: Dict[str, Dict] = {}
+        for data in self.collect(
+            targets, revs, recursive, onerror=onerror, props=props
+        ):
+            assert len(data) == 1
+            revision_data = first(data.values())
+            if "data" in revision_data:
+                for path_data in revision_data["data"].values():
+                    result_source = path_data.pop("data_source", None)
+                    if result_source:
+                        path_data.update(result_source())
+            result.update(data)
 
-    def show(self, targets=None, revs=None, props=None, templates=None):
-        from .data import NoMetricInHistoryError
+        errored = errored_revisions(result)
+        if errored:
+            from dvc.ui import ui
 
-        data = self.collect(targets, revs)
+            ui.error_write(
+                "DVC failed to load some plots for following revisions: "
+                f"'{', '.join(errored)}'."
+            )
 
-        # If any mentioned plot doesn't have any data then that's an error
-        targets = [targets] if isinstance(targets, str) else targets or []
-        for target in targets:
-            if not any("data" in d[target] for d in data.values()):
-                raise NoMetricInHistoryError(target)
-
-        # No data at all is a special error with a special message
-        if not data:
-            raise NoPlotsError()
-
-        if templates is None:
-            templates = self.templates
-        return self.render(data, revs, props, templates)
+        return result
 
     def diff(self, *args, **kwargs):
         from .diff import diff
@@ -149,39 +231,52 @@ class Plots:
         return PlotTemplates(self.repo.dvc_dir)
 
 
-def _collect_plots(repo, targets=None, rev=None):
-    plots = {out for stage in repo.stages for out in stage.outs if out.plot}
+def _is_plot(out: "Output") -> bool:
+    return bool(out.plot) or bool(out.live)
 
-    def to_result(plots):
-        return {plot.path_info: _plot_props(plot) for plot in plots}
 
-    if not targets:
-        return to_result(plots)
+def _collect_plots(
+    repo: "Repo",
+    targets: List[str] = None,
+    rev: str = None,
+    recursive: bool = False,
+) -> Dict["List[str]", Dict]:
+    from dvc.repo.collect import collect
 
-    target_infos = {PathInfo(os.path.abspath(target)) for target in targets}
+    plots, fs_paths = collect(
+        repo,
+        output_filter=_is_plot,
+        targets=targets,
+        rev=rev,
+        recursive=recursive,
+    )
 
-    target_plots = set()
-    for p in plots:
-        if p.path_info in target_infos:
-            target_plots.add(p)
-            target_infos.remove(p.path_info)
-
-    tree = RepoTree(repo)
-    result = to_result(target_plots)
-
-    for t in target_infos:
-        if tree.isfile(t):
-            result[t] = {}
-        else:
-            logger.warning(
-                "'%s' was not found at: '%s'. It will not be plotted.", t, rev,
-            )
-
+    result = {plot.fs_path: _plot_props(plot) for plot in plots}
+    result.update({fs_path: {} for fs_path in fs_paths})
     return result
 
 
-def _plot_props(out):
-    if not out.plot:
+@error_handler
+def parse(fs, path, props=None, **kwargs):
+    props = props or {}
+    _, extension = os.path.splitext(path)
+    if extension in (".tsv", ".csv"):
+        header = props.get("header", True)
+        if extension == ".csv":
+            return _load_sv(path=path, fs=fs, delimiter=",", header=header)
+        return _load_sv(path=path, fs=fs, delimiter="\t", header=header)
+    if extension in LOADERS or extension in (".yml", ".yaml"):
+        return LOADERS[extension](path=path, fs=fs)
+    if extension in (".jpeg", ".jpg", ".gif", ".png"):
+        with fs.open(path, "rb") as fd:
+            return fd.read()
+    raise PlotMetricTypeError(path)
+
+
+def _plot_props(out: "Output") -> Dict:
+    from dvc.schema import PLOT_PROPS
+
+    if not (out.plot or out.live):
         raise NotAPlotError(out)
     if isinstance(out.plot, list):
         raise DvcException("Multiple plots per data file not supported.")
@@ -191,83 +286,25 @@ def _plot_props(out):
     return project(out.plot, PLOT_PROPS)
 
 
-def _prepare_plots(data, revs, props):
-    """Groups data by plot file.
+def _load_sv(path, fs, delimiter=",", header=True):
+    with fs.open(path, "r") as fd:
+        content = fd.read()
 
-    Also resolves props conflicts between revs and applies global props.
-    """
-    # we go in order revs are supplied on props conflict first ones win.
-    revs = iter(data) if revs is None else revs
+    first_row = first(csv.reader(io.StringIO(content)))
 
-    plots, props_revs = {}, {}
-    for rev in revs:
-        # Asked for revision without data
-        if rev not in data:
-            continue
-
-        for datafile, desc in data[rev].items():
-            # We silently skip on an absent data file,
-            # see also try/except/pass in .collect()
-            if "data" not in desc:
-                continue
-
-            # props from command line overwrite plot props from out definition
-            full_props = {**desc["props"], **props}
-
-            if datafile in plots:
-                saved = plots[datafile]
-                if saved["props"] != full_props:
-                    logger.warning(
-                        f"Inconsistent plot props for '{datafile}' in "
-                        f"'{props_revs[datafile]}' and '{rev}'. "
-                        f"Going to use ones from '{props_revs[datafile]}'"
-                    )
-
-                saved["data"][rev] = desc["data"]
-            else:
-                plots[datafile] = {
-                    "props": full_props,
-                    "data": {rev: desc["data"]},
-                }
-                # Save rev we got props from
-                props_revs[datafile] = rev
-
-    return plots
-
-
-def _render(datafile, datas, props, templates):
-    from .data import PlotData, plot_data
-
-    # Copy it to not modify a passed value
-    props = props.copy()
-
-    # Add x and y to fields if set
-    fields = props.get("fields")
-    if fields is not None:
-        fields = {*fields, props.get("x"), props.get("y")} - {None}
-
-    template = templates.load(props.get("template") or "default")
-
-    # If x is not set add index field
-    if not props.get("x") and template.has_anchor("x"):
-        props["append_index"] = True
-        props["x"] = PlotData.INDEX_FIELD
-
-    # Parse all data, preprocess it and collect as a list of dicts
-    data = []
-    for rev, datablob in datas.items():
-        rev_data = plot_data(datafile, rev, datablob).to_datapoints(
-            fields=fields,
-            path=props.get("path"),
-            header=props.get("header", True),
-            append_index=props.get("append_index", False),
+    if header:
+        reader = csv.DictReader(io.StringIO(content), delimiter=delimiter)
+    else:
+        reader = csv.DictReader(
+            io.StringIO(content),
+            delimiter=delimiter,
+            fieldnames=[str(i) for i in range(len(first_row))],
         )
-        data.extend(rev_data)
 
-    # If y is not set then use last field not used yet
-    if not props.get("y") and template.has_anchor("y"):
-        fields = list(first(data))
-        skip = (PlotData.REVISION_FIELD, props.get("x"))
-        props["y"] = first(f for f in reversed(fields) if f not in skip)
+    fieldnames = reader.fieldnames
+    data = list(reader)
 
-    return template.render(data, props=props)
+    return [
+        OrderedDict([(field, data_point[field]) for field in fieldnames])
+        for data_point in data
+    ]

@@ -1,27 +1,52 @@
 import os
+from unittest.mock import call
 
-import mock
+import pytest
 
-from dvc.analytics import _scm_in_use
+from dvc.analytics import _scm_in_use, collect_and_send_report
 from dvc.main import main
 from dvc.repo import Repo
+from tests.utils import ANY
 
 
-@mock.patch("dvc.analytics.send")
-def test_daemon_analytics(mock_send, tmp_path):
+def test_daemon_analytics(mocker, tmp_path):
+    mock_send = mocker.patch("dvc.analytics.send")
     report = os.fspath(tmp_path)
     assert 0 == main(["daemon", "analytics", report])
 
     mock_send.assert_called_with(report)
 
 
-@mock.patch("dvc.analytics.collect_and_send_report")
-@mock.patch("dvc.analytics.is_enabled", return_value=True)
-def test_main_analytics(mock_is_enabled, mock_report, tmp_dir, dvc):
+def test_main_analytics(mocker, tmp_dir, dvc):
+    mock_is_enabled = mocker.patch("dvc.analytics.collect_and_send_report")
+    mock_report = mocker.patch("dvc.analytics.is_enabled", return_value=True)
     tmp_dir.gen("foo", "text")
     assert 0 == main(["add", "foo"])
     assert mock_is_enabled.called
     assert mock_report.called
+
+
+@pytest.fixture
+def mock_daemon(mocker):
+    def func(argv):
+        return main(["daemon", *argv])
+
+    m = mocker.patch("dvc.daemon.daemon", mocker.MagicMock(side_effect=func))
+    yield m
+
+
+def test_collect_and_send_report(mocker, dvc, mock_daemon):
+    mock_post = mocker.patch("requests.post")
+    collect_and_send_report()
+
+    assert mock_daemon.call_count == 1
+    assert mock_post.call_count == 1
+    assert mock_post.call_args == call(
+        "https://analytics.dvc.org",
+        json=ANY(dict),
+        headers={"content-type": "application/json"},
+        timeout=5,
+    )
 
 
 def test_scm_dvc_only(tmp_dir, dvc):

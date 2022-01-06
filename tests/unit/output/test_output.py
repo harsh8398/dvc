@@ -1,12 +1,21 @@
 import logging
+import os
 
 import pytest
 from funcy import first
 from voluptuous import MultipleInvalid, Schema
 
-from dvc.cache import NamedCache
 from dvc.ignore import _no_match
-from dvc.output import CHECKSUM_SCHEMA, BaseOutput
+from dvc.output import CHECKSUM_SCHEMA, Output
+from dvc.stage import Stage
+
+
+def test_save_missing(dvc, mocker):
+    stage = Stage(dvc)
+    out = Output(stage, "path", cache=False)
+    with mocker.patch.object(out.fs, "exists", return_value=False):
+        with pytest.raises(out.DoesNotExistError):
+            out.save()
 
 
 @pytest.mark.parametrize(
@@ -69,24 +78,25 @@ def test_checksum_schema_fail(value):
         ),
     ],
 )
-def test_get_used_cache(exists, expected_message, mocker, caplog):
+def test_get_used_objs(exists, expected_message, mocker, caplog):
     stage = mocker.MagicMock()
     mocker.patch.object(stage, "__str__", return_value="stage: 'stage.dvc'")
     mocker.patch.object(stage, "addressing", "stage.dvc")
+    mocker.patch.object(stage, "wdir", os.getcwd())
+    mocker.patch.object(stage.repo, "root_dir", os.getcwd())
+    mocker.patch.object(stage.repo.dvcignore, "is_ignored", return_value=False)
     mocker.patch.object(
-        stage.repo.tree.dvcignore,
-        "check_ignore",
-        return_value=_no_match("path"),
+        stage.repo.dvcignore, "check_ignore", return_value=_no_match("path")
     )
 
-    output = BaseOutput(stage, "path")
+    output = Output(stage, "path")
 
     mocker.patch.object(output, "use_cache", True)
     mocker.patch.object(stage, "is_repo_import", False)
     mocker.patch.object(
-        BaseOutput, "exists", new_callable=mocker.PropertyMock
+        Output, "exists", new_callable=mocker.PropertyMock
     ).return_value = exists
 
     with caplog.at_level(logging.WARNING, logger="dvc"):
-        assert isinstance(output.get_used_cache(), NamedCache)
+        assert {} == output.get_used_objs()
     assert first(caplog.messages) == expected_message

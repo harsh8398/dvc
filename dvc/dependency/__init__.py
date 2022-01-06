@@ -1,62 +1,24 @@
 from collections import defaultdict
-from urllib.parse import urlparse
+from typing import Any, Mapping
 
-import dvc.output as output
-from dvc.dependency.azure import AzureDependency
-from dvc.dependency.gs import GSDependency
-from dvc.dependency.hdfs import HDFSDependency
-from dvc.dependency.http import HTTPDependency
-from dvc.dependency.https import HTTPSDependency
-from dvc.dependency.local import LocalDependency
-from dvc.dependency.param import ParamsDependency
-from dvc.dependency.s3 import S3Dependency
-from dvc.dependency.ssh import SSHDependency
-from dvc.output.base import BaseOutput
-from dvc.scheme import Schemes
+from dvc.output import ARTIFACT_SCHEMA, Output
 
-from ..tree import get_cloud_tree
+from .base import Dependency
+from .param import ParamsDependency
 from .repo import RepoDependency
-
-DEPS = [
-    AzureDependency,
-    GSDependency,
-    HDFSDependency,
-    HTTPDependency,
-    HTTPSDependency,
-    S3Dependency,
-    SSHDependency,
-    # NOTE: LocalDependency is the default choice
-]
-
-DEP_MAP = {
-    Schemes.LOCAL: LocalDependency,
-    Schemes.SSH: SSHDependency,
-    Schemes.S3: S3Dependency,
-    Schemes.AZURE: AzureDependency,
-    Schemes.GS: GSDependency,
-    Schemes.HDFS: HDFSDependency,
-    Schemes.HTTP: HTTPDependency,
-    Schemes.HTTPS: HTTPSDependency,
-}
-
 
 # NOTE: schema for dependencies is basically the same as for outputs, but
 # without output-specific entries like 'cache' (whether or not output is
 # cached, see -o and -O flags for `dvc run`) and 'metric' (whether or not
-# output is a metric file and how to parse it, see `-M` flag for `dvc run`).
-SCHEMA = output.SCHEMA.copy()
-del SCHEMA[BaseOutput.PARAM_CACHE]
-del SCHEMA[BaseOutput.PARAM_METRIC]
-SCHEMA.update(RepoDependency.REPO_SCHEMA)
-SCHEMA.update(ParamsDependency.PARAM_SCHEMA)
+# output is a metrics file and how to parse it, see `-M` flag for `dvc run`).
+SCHEMA: Mapping[str, Any] = {
+    **ARTIFACT_SCHEMA,
+    **RepoDependency.REPO_SCHEMA,
+    **ParamsDependency.PARAM_SCHEMA,
+}
 
 
 def _get(stage, p, info):
-    parsed = urlparse(p) if p else None
-    if parsed and parsed.scheme == "remote":
-        tree = get_cloud_tree(stage.repo, name=parsed.netloc)
-        return DEP_MAP[tree.scheme](stage, p, info, tree=tree)
-
     if info and info.get(RepoDependency.PARAM_REPO):
         repo = info.pop(RepoDependency.PARAM_REPO)
         return RepoDependency(repo, stage, p, info)
@@ -65,16 +27,13 @@ def _get(stage, p, info):
         params = info.pop(ParamsDependency.PARAM_PARAMS)
         return ParamsDependency(stage, p, params)
 
-    for d in DEPS:
-        if d.supported(p):
-            return d(stage, p, info)
-    return LocalDependency(stage, p, info)
+    return Dependency(stage, p, info)
 
 
 def loadd_from(stage, d_list):
     ret = []
     for d in d_list:
-        p = d.pop(BaseOutput.PARAM_PATH, None)
+        p = d.pop(Output.PARAM_PATH, None)
         ret.append(_get(stage, p, d))
     return ret
 

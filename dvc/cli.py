@@ -4,6 +4,7 @@ import logging
 import os
 import sys
 
+from ._debug import add_debugging_flags
 from .command import (
     add,
     cache,
@@ -27,7 +28,9 @@ from .command import (
     imp_url,
     init,
     install,
+    live,
     ls,
+    machine,
     metrics,
     move,
     params,
@@ -37,6 +40,7 @@ from .command import (
     repro,
     root,
     run,
+    stage,
     unprotect,
     update,
     version,
@@ -80,8 +84,11 @@ COMMANDS = [
     update,
     git_hook,
     plots,
+    stage,
     experiments,
     check_ignore,
+    live,
+    machine,
 ]
 
 
@@ -137,15 +144,7 @@ def get_parent_parser():
     in order to prevent some weird behavior.
     """
     parent_parser = argparse.ArgumentParser(add_help=False)
-
-    parent_parser.add_argument(
-        "--cprofile",
-        action="store_true",
-        default=False,
-        help=argparse.SUPPRESS,
-    )
-    parent_parser.add_argument("--cprofile-dump", help=argparse.SUPPRESS)
-
+    add_debugging_flags(parent_parser)
     log_level_group = parent_parser.add_mutually_exclusive_group()
     log_level_group.add_argument(
         "-q", "--quiet", action="count", default=0, help="Be quiet."

@@ -1,18 +1,16 @@
 import os
 import sys
 
-# FIXME: Search and replace these from the tests if pyarrow wheel is available
-PY39 = sys.version_info >= (3, 9, 0)
-PYARROW_NOT_AVAILABLE = "pyarrow not available yet for Python3.9"
-
-
 # Increasing fd ulimit for tests
 if os.name == "nt":
     import subprocess
 
-    import win32file  # pylint: disable=import-error
-
-    win32file._setmaxstdio(2048)
+    try:
+        import win32file  # pylint: disable=import-error
+    except ImportError:
+        pass
+    else:
+        win32file._setmaxstdio(4096)
 
     # Workaround for two bugs:
     #
@@ -29,15 +27,19 @@ if os.name == "nt":
     # exception, which it doesn't ignore and so Popen is not able to cleanup
     # old processes and that prevents it from creating any new processes at
     # all, which results in our tests failing whenever they try to use Popen.
+    # This patch was released in 3.9.0 and backported to some earlier
+    # versions.
+    if sys.version_info < (3, 9, 0):
 
-    def noop():
-        pass
+        def noop():
+            pass
 
-    subprocess._cleanup = noop
+        subprocess._cleanup = noop
+        subprocess._active = None
 else:
-    import resource
+    import resource  # pylint: disable=import-error
 
-    resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 2048))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (4096, 4096))
 
     nproc_soft, nproc_hard = resource.getrlimit(resource.RLIMIT_NPROC)
     resource.setrlimit(resource.RLIMIT_NPROC, (nproc_hard, nproc_hard))

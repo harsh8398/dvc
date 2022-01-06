@@ -1,13 +1,10 @@
+import os
 from itertools import chain
 
 from dvc.exceptions import PathMissingError
-from dvc.path_info import PathInfo
 
 
-@staticmethod
-def ls(
-    url, path=None, rev=None, recursive=None, dvc_only=False,
-):
+def ls(url, path=None, rev=None, recursive=None, dvc_only=False):
     """Methods for getting files and outputs for the repo.
 
     Args:
@@ -29,16 +26,14 @@ def ls(
             "isexec": bool,
         }
     """
-    from dvc.external_repo import external_repo
+    from . import Repo
 
-    # use our own RepoTree instance instead of repo.repo_tree since we want to
-    # fetch directory listings, but don't want to fetch file contents.
-    with external_repo(url, rev, fetch=False, stream=True) as repo:
-        path_info = PathInfo(repo.root_dir)
+    with Repo.open(url, rev=rev, subrepos=True, uninitialized=True) as repo:
+        fs_path = repo.root_dir
         if path:
-            path_info /= path
+            fs_path = os.path.abspath(repo.fs.path.join(fs_path, path))
 
-        ret = _ls(repo, path_info, recursive, dvc_only)
+        ret = _ls(repo.repo_fs, fs_path, recursive, dvc_only)
 
         if path and not ret:
             raise PathMissingError(path, repo, dvc_only=dvc_only)
@@ -51,34 +46,32 @@ def ls(
         return ret_list
 
 
-def _ls(repo, path_info, recursive=None, dvc_only=False):
+def _ls(fs, fs_path, recursive=None, dvc_only=False):
     def onerror(exc):
         raise exc
 
-    tree = repo.repo_tree
-
     infos = []
     try:
-        for root, dirs, files in tree.walk(
-            path_info.fspath, onerror=onerror, dvcfiles=True
+        for root, dirs, files in fs.walk(
+            fs_path, onerror=onerror, dvcfiles=True
         ):
             entries = chain(files, dirs) if not recursive else files
-            infos.extend(PathInfo(root) / entry for entry in entries)
+            infos.extend(fs.path.join(root, entry) for entry in entries)
             if not recursive:
                 break
     except NotADirectoryError:
-        infos.append(path_info)
+        infos.append(fs_path)
     except FileNotFoundError:
         return {}
 
     ret = {}
     for info in infos:
-        metadata = tree.metadata(info)
+        metadata = fs.metadata(info)
         if metadata.output_exists or not dvc_only:
             path = (
-                path_info.name
-                if path_info == info
-                else str(info.relative_to(path_info))
+                fs.path.name(fs_path)
+                if fs_path == info
+                else fs.path.relpath(info, fs_path)
             )
             ret[path] = {
                 "isout": metadata.is_output,
